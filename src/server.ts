@@ -110,10 +110,12 @@ export const opaque = (options?: OpaqueOptions) => {
 	if (options?.OPAQUE_SERVER_KEY) {
 		OPAQUE_SERVER_KEY = options.OPAQUE_SERVER_KEY;
 	} else {
-		OPAQUE_SERVER_KEY = server.createSetup();
-		console.log(
-			`OPAQUE_SERVER_KEY not provided. Generated a new one for development purposes: ${OPAQUE_SERVER_KEY}`,
-		);
+		ready.then(() => {
+			OPAQUE_SERVER_KEY = server.createSetup();
+			console.log(
+				`OPAQUE_SERVER_KEY not provided. Generated a new one for development purposes: ${OPAQUE_SERVER_KEY}`,
+			);
+		})
 	}
 	let dummyRegistrationRecord: string;
 
