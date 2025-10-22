@@ -14,7 +14,6 @@ import {
 	REGISTRATION_RECORD_MAX_LENGTH,
 	REGISTRATION_RECORD_MIN_LENGTH,
 	REGISTRATION_REQUEST_LENGTH,
-	sleep,
 	validateBase64Length,
 	validateBase64LengthRange,
 } from "./utils";
@@ -69,11 +68,27 @@ export const opaque = (options?: OpaqueOptions) => {
 						"registration request",
 					);
 
+					const startTime = performance.now();
+
+					// CRITICAL: Check if user exists to ensure timing consistency
+					// Even though we don't use this information here, checking ensures
+					// both new and existing user registrations hit the database similarly
+					const existingUser =
+						await ctx.context.internalAdapter.findUserByEmail(email);
+
+					ctx.context.logger.debug(
+						`[CHALLENGE] ${email.substring(0, 20)}... - User exists: ${!!existingUser} - DB lookup: ${(performance.now() - startTime).toFixed(2)}ms`,
+					);
+
 					const { registrationResponse } = server.createRegistrationResponse({
 						userIdentifier: email,
 						registrationRequest,
 						serverSetup: OPAQUE_SERVER_KEY,
 					});
+
+					ctx.context.logger.debug(
+						`[CHALLENGE] Total time: ${(performance.now() - startTime).toFixed(2)}ms`,
+					);
 					return { challenge: registrationResponse };
 				},
 			),
@@ -97,68 +112,52 @@ export const opaque = (options?: OpaqueOptions) => {
 						"registration record",
 					);
 
+					const startTime = performance.now();
 					const now = new Date();
 
 					const existingUser =
 						await ctx.context.internalAdapter.findUserByEmail(email);
 
-					const approximateDbWriteTimeMs = 120;
+					ctx.context.logger.debug(
+						`[COMPLETE] ${email.substring(0, 20)}... - User exists: ${!!existingUser} - DB lookup: ${(performance.now() - startTime).toFixed(2)}ms`,
+					);
 
-					if (existingUser) {
-						// Simulate 2 database writes with independent jitter
-						for (let i = 0; i < 2; i++) {
-							const jitter = Math.random() * 50;
-							await sleep(approximateDbWriteTimeMs + jitter);
+					if (!existingUser) {
+						// User doesn't exist - proceed with actual creation
+						const userId = ctx.context.generateId({ model: "user" });
+						const accountId = ctx.context.generateId({ model: "account" });
+
+						if (!userId || !accountId) {
+							throw new Error("Failed to generate user or account ID");
 						}
 
-						const fakeUserId = ctx.context.generateId({ model: "user" });
+						const user = await ctx.context.internalAdapter.createUser({
+							email,
+							name,
+							createdAt: now,
+							updatedAt: now,
+						});
 
-						if (!fakeUserId) {
-							throw new Error("Failed to generate fake user ID");
-						}
+						await ctx.context.internalAdapter.createAccount({
+							accountId,
+							providerId: "opaque",
+							userId: user.id,
+							registrationRecord,
+							createdAt: now,
+							updatedAt: now,
+						});
 
-						const fakeAccountId = ctx.context.generateId({ model: "account" });
-
-						if (!fakeAccountId) {
-							throw new Error("Failed to generate fake account ID");
-						}
-
-
-						return ctx.json(
-							{
-								success: true,
-								message: "User registered successfully",
-							},
-							{
-								status: 201,
-							},
+						ctx.context.logger.debug(
+							`[COMPLETE] User created - Total time: ${(performance.now() - startTime).toFixed(2)}ms`,
+						);
+					} else {
+						ctx.context.logger.debug(
+							`[COMPLETE] User exists - Total time: ${(performance.now() - startTime).toFixed(2)}ms`,
 						);
 					}
 
-					const user = await ctx.context.internalAdapter.createUser({
-						email,
-						name,
-						createdAt: now,
-						updatedAt: now,
-					});
-
-					const accountId = ctx.context.generateId({
-						model: "account",
-					});
-
-					if (!accountId) {
-						throw new Error("Failed to generate account ID");
-					}
-
-					await ctx.context.internalAdapter.createAccount({
-						accountId,
-						providerId: "opaque",
-						userId: user.id,
-						registrationRecord,
-						createdAt: now,
-						updatedAt: now,
-					});
-
+					// Always return success (whether user was created or already existed)
+					// This prevents user enumeration through registration attempts
 					return ctx.json(
 						{
 							success: true,
@@ -189,7 +188,12 @@ export const opaque = (options?: OpaqueOptions) => {
 						"login request",
 					);
 
-					const user = await ctx.context.internalAdapter.findUserByEmail(email);
+					// CRITICAL: Always generate a dummy record for timing attack resistance
+					// Both code paths (user exists/doesn't exist) must perform the same expensive operations
+					const [dummyRecord, user] = await Promise.all([
+						createDummyRegistrationRecord(),
+						ctx.context.internalAdapter.findUserByEmail(email),
+					]);
 
 					let registrationRecord: string;
 					let userToEncrypt: {
@@ -200,18 +204,19 @@ export const opaque = (options?: OpaqueOptions) => {
 					} | null = null;
 
 					if (!user) {
-						registrationRecord = await createDummyRegistrationRecord();
+						// User doesn't exist - use the dummy record
+						registrationRecord = dummyRecord;
 						userToEncrypt = {
 							id: generateRandomString(12),
 							email,
 							name: generateRandomString(24),
 						};
 					} else {
+						// User exists - get their real record but discard the dummy we generated
 						userToEncrypt = user.user;
 						const opaqueAccount = await findOpaqueAccount(ctx, user.user.id);
 						registrationRecord =
-							opaqueAccount?.registrationRecord ||
-							(await createDummyRegistrationRecord());
+							opaqueAccount?.registrationRecord || dummyRecord;
 					}
 
 					const { loginResponse, serverLoginState } = server.startLogin({
