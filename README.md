@@ -11,7 +11,7 @@ This plugin allows you to build authentication systems where the server **never*
 
 * **Zero-Knowledge:** The server remains completely ignorant of user passwords, fulfilling a core tenet of privacy-first design.
 * **Post-Breach Security:** User passwords cannot be cracked offline even if an attacker steals your entire database and server secrets.
-* **Built-in User Enumeration Protection:** The login flow is designed to be constant-time, preventing attackers from discovering which emails are registered on your service.
+* **Built-in User Enumeration Protection:** The login and registration flow is designed to be constant-time, preventing attackers from discovering which emails are registered on your service.
 * **Seamless Integration:** Designed to work flawlessly within the Better Auth ecosystem.
 * **Client-Agnostic API:** Provides a clear, multi-stage API for any frontend (web, mobile, CLI) to interact with.
 
@@ -74,7 +74,7 @@ import { opaque } from "better-auth-opaque";
 
 export const auth = BetterAuth({
     adapter: YourAdapter(),
-    secret: process.env.AUTH_SECRET,
+    secret: process.env.AUTH_SECRET, // Used to encrypt user data when sent to the client for login
     plugins: [
         // Add the OPAQUE plugin
         opaque({
