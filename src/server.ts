@@ -1,14 +1,8 @@
 import { ready, server } from "@serenity-kit/opaque";
-import {
-	APIError,
-	type BetterAuthPlugin,
-	type User
-} from "better-auth";
+import { APIError, type BetterAuthPlugin, type User } from "better-auth";
 import { createAuthEndpoint } from "better-auth/api";
 import { setSessionCookie } from "better-auth/cookies";
-import {
-	generateRandomString
-} from "better-auth/crypto";
+import { generateRandomString } from "better-auth/crypto";
 import * as z from "zod";
 import {
 	createDummyRegistrationRecord,
@@ -24,7 +18,6 @@ import {
 	validateBase64Length,
 	validateBase64LengthRange,
 } from "./utils";
-
 
 export const opaque = (options?: OpaqueOptions) => {
 	let OPAQUE_SERVER_KEY: string;
@@ -109,74 +102,37 @@ export const opaque = (options?: OpaqueOptions) => {
 					const existingUser =
 						await ctx.context.internalAdapter.findUserByEmail(email);
 
-					if (existingUser) {
-						const approximateDbWriteTimeMs = 150;
+					const approximateDbWriteTimeMs = 120;
 
-						// Simulate 3 database writes with independent jitter
-						for (let i = 0; i < 3; i++) {
+					if (existingUser) {
+						// Simulate 2 database writes with independent jitter
+						for (let i = 0; i < 2; i++) {
 							const jitter = Math.random() * 50;
-							await sleep(approximateDbWriteTimeMs + jitter)
+							await sleep(approximateDbWriteTimeMs + jitter);
 						}
 
-						// const fakeUserId = ctx.context.generateId({ model: "user" });
+						const fakeUserId = ctx.context.generateId({ model: "user" });
 
-						// if (!fakeUserId) {
-						// 	throw new Error("Failed to generate fake user ID");
-						// }
+						if (!fakeUserId) {
+							throw new Error("Failed to generate fake user ID");
+						}
 
-						// const fakeSessionId = ctx.context.generateId({ model: "session" });
+						const fakeAccountId = ctx.context.generateId({ model: "account" });
 
-						// if (!fakeSessionId) {
-						// 	throw new Error("Failed to generate fake session ID");
-						// }
+						if (!fakeAccountId) {
+							throw new Error("Failed to generate fake account ID");
+						}
 
-						// const session = {
-						// 	token: generateRandomString(48),
-						// 	createdAt: now,
-						// 	expiresAt: new Date(now.getTime() + 1000 * 60 * 60), // 1 hour
-						// 	id: fakeSessionId,
-						// 	updatedAt: now,
-						// 	userId: fakeUserId,
-						// };
 
-						// const fakeUser: User = {
-						// 	id: fakeUserId,
-						// 	email,
-						// 	name,
-						// 	createdAt: now,
-						// 	updatedAt: now,
-						// 	emailVerified: false,
-						// };
-
-						// setSessionCookie(ctx, {
-						// 	session,
-						// 	user: fakeUser,
-						// });
-
-						// return ctx.json(
-						// 	{
-						// 		success: true,
-						// 		message: "User registered successfully",
-						// 		token: session.token,
-						// 		user: {
-						// 			id: fakeUser.id,
-						// 		},
-						// 	},
-						// 	{
-						// 		status: 201,
-						// 	},
-						// );
-						
-						// The code above is meant to mitigate timing attacks during registration by simulating
-						// database operations even when the user already exists. However, it is currently
-						// commented out because I'm not sure how I want to handle this. The current flow will
-						// cause UX issues for real users who are trying to register with an existing email.
-						// Maybe this UX issue is worth it for the security, but I can't think of a good way to
-						// get around it.
-						
-						throw new APIError("CONFLICT", {
-							message: "User with this email already exists",
-						});
+						return ctx.json(
+							{
+								success: true,
+								message: "User registered successfully",
+							},
+							{
+								status: 201,
+							},
+						);
 					}
 
 					const user = await ctx.context.internalAdapter.createUser({
@@ -189,6 +145,7 @@ export const opaque = (options?: OpaqueOptions) => {
 					const accountId = ctx.context.generateId({
 						model: "account",
 					});
+
 					if (!accountId) {
 						throw new Error("Failed to generate account ID");
 					}
@@ -202,28 +159,10 @@ export const opaque = (options?: OpaqueOptions) => {
 						updatedAt: now,
 					});
 
-					const session = await ctx.context.internalAdapter.createSession(
-						user.id,
-						ctx,
-						false,
-					);
-
-					if (!session) {
-						throw new APIError("INTERNAL_SERVER_ERROR", {
-							message: "Failed to create session",
-						});
-					}
-
-					await setSessionCookie(ctx, { session, user });
-
 					return ctx.json(
 						{
 							success: true,
 							message: "User registered successfully",
-							token: session.token,
-							user: {
-								id: user.id,
-							},
 						},
 						{
 							status: 201,
@@ -306,11 +245,19 @@ export const opaque = (options?: OpaqueOptions) => {
 				async (ctx) => {
 					const { loginResult, encryptedServerState, dontRememberMe } =
 						ctx.body;
+					let serverLoginState: string;
+					let user: User | null;
 
-					const { serverLoginState, user } = await decryptServerLoginState(
-						encryptedServerState,
-						ctx.context.secret,
-					);
+					try {
+						({ serverLoginState, user } = await decryptServerLoginState(
+							encryptedServerState,
+							ctx.context.secret,
+						));
+					} catch {
+						throw new APIError("BAD_REQUEST", {
+							message: "Invalid login state",
+						});
+					}
 
 					const { sessionKey } = server.finishLogin({
 						finishLoginRequest: loginResult,
