@@ -1,108 +1,30 @@
-import { client, ready, server } from "@serenity-kit/opaque";
+import { ready, server } from "@serenity-kit/opaque";
 import {
-	type Account,
 	APIError,
 	type BetterAuthPlugin,
-	type User,
+	type User
 } from "better-auth";
 import { createAuthEndpoint } from "better-auth/api";
 import { setSessionCookie } from "better-auth/cookies";
 import {
-	generateRandomString,
-	symmetricDecrypt,
-	symmetricEncrypt,
+	generateRandomString
 } from "better-auth/crypto";
 import * as z from "zod";
+import {
+	createDummyRegistrationRecord,
+	decryptServerLoginState,
+	encryptServerLoginState,
+	findOpaqueAccount,
+	LOGIN_REQUEST_LENGTH,
+	type OpaqueOptions,
+	REGISTRATION_RECORD_MAX_LENGTH,
+	REGISTRATION_RECORD_MIN_LENGTH,
+	REGISTRATION_REQUEST_LENGTH,
+	sleep,
+	validateBase64Length,
+	validateBase64LengthRange,
+} from "./utils";
 
-interface OpaqueOptions {
-	OPAQUE_SERVER_KEY: string;
-}
-
-const REGISTRATION_REQUEST_LENGTH = 32;
-const REGISTRATION_RECORD_MIN_LENGTH = 170;
-const REGISTRATION_RECORD_MAX_LENGTH = 200;
-const LOGIN_REQUEST_LENGTH = 96;
-
-function base64UrlDecode(str: string): string {
-	const padded = str + "=".repeat((4 - (str.length % 4)) % 4);
-	return atob(padded.replace(/-/g, "+").replace(/_/g, "/"));
-}
-
-function validateBase64Length(
-	base64: string,
-	expectedLength: number,
-	fieldName: string,
-): void {
-	const bytes = base64UrlDecode(base64);
-	if (bytes.length !== expectedLength) {
-		throw new APIError("BAD_REQUEST", {
-			message: `Invalid ${fieldName}`,
-		});
-	}
-}
-
-function validateBase64LengthRange(
-	base64: string,
-	min: number,
-	max: number,
-	fieldName: string,
-): void {
-	const bytes = base64UrlDecode(base64);
-	if (bytes.length < min || bytes.length > max) {
-		throw new APIError("BAD_REQUEST", {
-			message: `Invalid ${fieldName}`,
-		});
-	}
-}
-
-async function encryptServerLoginState(
-	serverLoginState: string,
-	secret: string,
-	user: {
-		id: string;
-		email: string;
-		name: string;
-		[key: string]: unknown;
-	} | null,
-): Promise<string> {
-	return await symmetricEncrypt({
-		data: JSON.stringify({ serverLoginState, user }),
-		key: secret,
-	});
-}
-
-async function decryptServerLoginState(
-	encryptedState: string,
-	secret: string,
-): Promise<{
-	serverLoginState: string;
-	user: {
-		id: string;
-		email: string;
-		name: string;
-		[key: string]: unknown;
-	} | null;
-}> {
-	const decrypted = await symmetricDecrypt({
-		key: secret,
-		data: encryptedState,
-	});
-	return JSON.parse(decrypted);
-}
-
-async function findOpaqueAccount(
-	ctx: {
-		context: {
-			internalAdapter: { findAccounts: (userId: string) => Promise<Account[]> };
-		};
-	},
-	userId: string,
-): Promise<(Account & { registrationRecord: string }) | undefined> {
-	const accounts = await ctx.context.internalAdapter.findAccounts(userId);
-	return accounts.find((account: Account) => account.providerId === "opaque") as
-		| (Account & { registrationRecord: string })
-		| undefined;
-}
 
 export const opaque = (options?: OpaqueOptions) => {
 	let OPAQUE_SERVER_KEY: string;
@@ -115,38 +37,13 @@ export const opaque = (options?: OpaqueOptions) => {
 			console.log(
 				`OPAQUE_SERVER_KEY not provided. Generated a new one for development purposes: ${OPAQUE_SERVER_KEY}`,
 			);
-		})
+		});
 	}
-	let dummyRegistrationRecord: string;
 
 	return {
 		id: "opaque",
 		init: async () => {
 			await ready;
-
-			const tempServerSetup = server.createSetup(); // Use a temporary key
-
-			const userId = generateRandomString(12);
-			const password = generateRandomString(24);
-
-			const { registrationRequest, clientRegistrationState } =
-				client.startRegistration({
-					password,
-				});
-
-			const { registrationResponse } = server.createRegistrationResponse({
-				registrationRequest,
-				serverSetup: tempServerSetup,
-				userIdentifier: userId,
-			});
-
-			const { registrationRecord } = client.finishRegistration({
-				clientRegistrationState,
-				registrationResponse,
-				password,
-			});
-
-			dummyRegistrationRecord = registrationRecord;
 		},
 		schema: {
 			account: {
@@ -208,6 +105,80 @@ export const opaque = (options?: OpaqueOptions) => {
 					);
 
 					const now = new Date();
+
+					const existingUser =
+						await ctx.context.internalAdapter.findUserByEmail(email);
+
+					if (existingUser) {
+						// const approximateDbWriteTimeMs = 150;
+
+						// // Simulate 3 database writes with independent jitter
+						// for (let i = 0; i < 3; i++) {
+						// 	const jitter = Math.random() * 50;
+						// 	await sleep(approximateDbWriteTimeMs + jitter)
+						// }
+
+						// const fakeUserId = ctx.context.generateId({ model: "user" });
+
+						// if (!fakeUserId) {
+						// 	throw new Error("Failed to generate fake user ID");
+						// }
+
+						// const fakeSessionId = ctx.context.generateId({ model: "session" });
+
+						// if (!fakeSessionId) {
+						// 	throw new Error("Failed to generate fake session ID");
+						// }
+
+						// const session = {
+						// 	token: generateRandomString(48),
+						// 	createdAt: now,
+						// 	expiresAt: new Date(now.getTime() + 1000 * 60 * 60), // 1 hour
+						// 	id: fakeSessionId,
+						// 	updatedAt: now,
+						// 	userId: fakeUserId,
+						// };
+
+						// const fakeUser: User = {
+						// 	id: fakeUserId,
+						// 	email,
+						// 	name,
+						// 	createdAt: now,
+						// 	updatedAt: now,
+						// 	emailVerified: false,
+						// };
+
+						// setSessionCookie(ctx, {
+						// 	session,
+						// 	user: fakeUser,
+						// });
+
+						// return ctx.json(
+						// 	{
+						// 		success: true,
+						// 		message: "User registered successfully",
+						// 		token: session.token,
+						// 		user: {
+						// 			id: fakeUser.id,
+						// 		},
+						// 	},
+						// 	{
+						// 		status: 201,
+						// 	},
+						// );
+						
+						// The code above is meant to mitigate timing attacks during registration by simulating
+						// database operations even when the user already exists. However, it is currently
+						// commented out because I'm not sure how I want to handle this. The current flow will
+						// cause UX issues for real users who are trying to register with an existing email.
+						// Maybe this UX issue is worth it for the security, but I can't think of a good way to
+						// get around it.
+						
+						throw new APIError("CONFLICT", {
+							message: "User with this email already exists",
+						});
+					}
+
 					const user = await ctx.context.internalAdapter.createUser({
 						email,
 						name,
@@ -236,6 +207,7 @@ export const opaque = (options?: OpaqueOptions) => {
 						ctx,
 						false,
 					);
+
 					if (!session) {
 						throw new APIError("INTERNAL_SERVER_ERROR", {
 							message: "Failed to create session",
@@ -259,6 +231,7 @@ export const opaque = (options?: OpaqueOptions) => {
 					);
 				},
 			),
+
 			getLoginChallenge: createAuthEndpoint(
 				"/sign-in/opaque/challenge",
 				{
@@ -279,7 +252,6 @@ export const opaque = (options?: OpaqueOptions) => {
 
 					const user = await ctx.context.internalAdapter.findUserByEmail(email);
 
-					// Determine registration record (use dummy for non-existent users to prevent enumeration)
 					let registrationRecord: string;
 					let userToEncrypt: {
 						id: string;
@@ -289,12 +261,18 @@ export const opaque = (options?: OpaqueOptions) => {
 					} | null = null;
 
 					if (!user) {
-						registrationRecord = dummyRegistrationRecord;
+						registrationRecord = await createDummyRegistrationRecord();
+						userToEncrypt = {
+							id: generateRandomString(12),
+							email,
+							name: generateRandomString(24),
+						};
 					} else {
 						userToEncrypt = user.user;
 						const opaqueAccount = await findOpaqueAccount(ctx, user.user.id);
 						registrationRecord =
-							opaqueAccount?.registrationRecord || dummyRegistrationRecord;
+							opaqueAccount?.registrationRecord ||
+							(await createDummyRegistrationRecord());
 					}
 
 					const { loginResponse, serverLoginState } = server.startLogin({
@@ -365,6 +343,7 @@ export const opaque = (options?: OpaqueOptions) => {
 					}
 
 					await setSessionCookie(ctx, { session, user: user as User });
+
 					return ctx.json({
 						token: session.token,
 						success: true,
