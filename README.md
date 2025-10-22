@@ -185,7 +185,7 @@ This plugin adds the following four endpoints to your Better Auth instance:
 | Flow         | Method | Endpoint                      | Purpose                                                        |
 | :----------- | :----- | :------------------------------ | :------------------------------------------------------------- |
 | **Register** | `POST` | `/api/auth/sign-up/opaque/challenge` | Client sends initial request; Server responds with a challenge.    |
-| **Register** | `POST` | `/api/auth/sign-up/opaque/complete`  | Client sends final record; Server creates user & session.        |
+| **Register** | `POST` | `/api/auth/sign-up/opaque/complete`  | Client sends final record; Server creates user BUT NOT a session.        |
 | **Login**    | `POST` | `/api/auth/sign-in/opaque/challenge` | Client sends initial request; Server responds with a challenge.    |
 | **Login**    | `POST` | `/api/auth/sign-in/opaque/complete`  | Client sends final proof; Server validates and creates a session. |
 
