@@ -5,7 +5,7 @@
 
 A Better Auth plugin that implements **zero-knowledge password authentication** using the **OPAQUE** protocol.
 
-This plugin allows you to build authentication systems where the server **never** sees, stores, or handles the user's raw password, providing exceptional security against a full database breach and active server compromise.
+This plugin allows you to build authentication systems where the server **never** sees, stores, or handles the user's raw password, providing exceptional security against a full database breach.
 
 ## Key Features
 
