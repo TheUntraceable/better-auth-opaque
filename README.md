@@ -126,7 +126,7 @@ export const AuthForm = () => {
             const { data: completeResponse } = await client.signUp.opaque.complete({
                 email,
                 name: "user",
-                registrationRecord: invalidRegistrationRecord,
+                registrationRecord,
             });
             // 5. The user is now registered BUT NOT logged in. You must log them in separately.
             // This is for security because registration can be used to enumerate users by seeing already registered emails
