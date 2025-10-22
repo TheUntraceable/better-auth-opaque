@@ -128,7 +128,10 @@ export const AuthForm = () => {
                 name: "user",
                 registrationRecord: invalidRegistrationRecord,
             });
-            // 5. The user is now registered and logged in!
+            // 5. The user is now registered BUT NOT logged in. You must log them in separately.
+            // This is for security because registration can be used to enumerate users by seeing already registered emails
+            // do not return a session on registration, yet registering new users does.
+
   
         } catch (error) {
             console.error('Registration failed:', error);
