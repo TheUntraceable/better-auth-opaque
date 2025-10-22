@@ -110,13 +110,13 @@ export const opaque = (options?: OpaqueOptions) => {
 						await ctx.context.internalAdapter.findUserByEmail(email);
 
 					if (existingUser) {
-						// const approximateDbWriteTimeMs = 150;
+						const approximateDbWriteTimeMs = 150;
 
-						// // Simulate 3 database writes with independent jitter
-						// for (let i = 0; i < 3; i++) {
-						// 	const jitter = Math.random() * 50;
-						// 	await sleep(approximateDbWriteTimeMs + jitter)
-						// }
+						// Simulate 3 database writes with independent jitter
+						for (let i = 0; i < 3; i++) {
+							const jitter = Math.random() * 50;
+							await sleep(approximateDbWriteTimeMs + jitter)
+						}
 
 						// const fakeUserId = ctx.context.generateId({ model: "user" });
 
