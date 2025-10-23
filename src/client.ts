@@ -4,6 +4,8 @@ import type { opaque } from "./server";
 
 type RegisterChallengeResponse = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["getRegisterChallenge"]>>
 type LoginChallengeResponse = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["getLoginChallenge"]>>
+type RegisterComplete = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["completeRegistration"]>>
+type LoginComplete = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["completeLogin"]>>
 
 export const opaqueClient = () => {
 	return {
@@ -40,7 +42,7 @@ export const opaqueClient = () => {
 							password,
 							registrationResponse,
 						})
-						return await $fetch("/sign-up/opaque/complete", {
+						return await $fetch<RegisterComplete>("/sign-up/opaque/complete", {
 							method: "POST",
 							body: {
 								email,
@@ -68,7 +70,7 @@ export const opaqueClient = () => {
 						});
 
 						if (!challengeResponse.data || !challengeResponse.data.challenge) {
-							return { error: { message: "Failed to get registration challenge" } };
+							return { data: null, error: { message: "Failed to get registration challenge" } };
 						}
 
 						const { challenge: loginResponse, state: encryptedServerState } = challengeResponse.data;
@@ -79,12 +81,12 @@ export const opaqueClient = () => {
 							loginResponse,
 						})
 						if (!loginAttempt) {
-							return { error: { message: "Login failed" } };
+							return { data: null, error: { message: "Login failed" } };
 						}
 
 						const { finishLoginRequest: loginResult } = loginAttempt;
 
-						return await $fetch("/sign-in/opaque/complete", {
+						return await $fetch<LoginComplete>("/sign-in/opaque/complete", {
 							method: "POST",
 							body: {
 								email,
