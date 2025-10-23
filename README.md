@@ -93,76 +93,33 @@ Here is a reference implementation using React/TypeScript.
 ```tsx
 // src/components/AuthForm.tsx
 import { useState } from 'react';
-import { client, ready } from '@serenity-kit/opaque';
 import { authClient } from "@/lib/auth-client";
-// Ensure the WASM module is ready before making any calls
-await ready;
 
 export const AuthForm = () => {
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
 
     const handleRegister = async () => {
-        try {
-            // 1. Start registration on the client
-            const { clientRegistrationState, registrationRequest } = client.startRegistration({ password });
-
-            // 2. Send the request to the server for a challenge
-            const {data: challengeResponse} = await client.signUp.opaque.challenge({
-                email,
-                registrationRequest,
-            });
-
-            const { challenge: registrationResponse } = challengeResponse
-
-            // 3. Finish registration on the client with the server's response
-            const { registrationRecord } = client.finishRegistration({
-                clientRegistrationState,
-                registrationResponse,
-                password,
-            });
-            
-            // 4. Send the final record to the server to create the account and session
-            const { data: completeResponse } = await client.signUp.opaque.complete({
-                email,
-                name: "user",
-                registrationRecord,
-            });
-            // 5. The user is now registered BUT NOT logged in. You must log them in separately.
-            // This is for security because registration can be used to enumerate users by seeing already registered emails
-            // do not return a session on registration, yet registering new users does.
-
-  
-        } catch (error) {
-            console.error('Registration failed:', error);
-        }
+        const { data, error } = await authClient.signUp.opaque({
+            email,
+            password,
+            name: "User's Name",
+        })
+        // The user is now registered BUT NOT logged in. You must log them in separately.
+        // This is for security because registration can be used to enumerate users by seeing already registered emails
+        // do not return a session on registration, yet registering new users does.
+        
+        // if you wish the user to be logged in immediately after registration,
+        // you can call the login function here.
     };
 
     const handleLogin = async () => {
         try {
-            // 1. Start the login process on the client
-            const { clientLoginState, loginRequest } = client.startLogin({ password });
-
-            // 2. Send the login request to the server for a challenge
-            const {data: challengeResponse} = await client.signIn.opaque.challenge({
+            const { data, error } = await authClient.signIn.opaque({
                 email,
-                loginRequest,
+                password
             });
-            const { challenge: loginResponse, state: encryptedServerState } = challengeResponse;
-
-            // 3. Finalize login on the client with the server's challenge
-            const { finishLoginRequest: loginResult } = client.finishLogin({
-                clientLoginState,
-                loginResponse,
-                password,
-            });
-
-            const { data, error } = await client.signIn.opaque.complete({
-                email,
-                loginResult: loginResult.finishLoginRequest,
-                encryptedServerState,
-            });
-            // 4. The user is now logged in!
+            // The user is now logged in!
         } catch (error) {
             console.error('Login failed:', error);
         }
