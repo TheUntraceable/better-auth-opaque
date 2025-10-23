@@ -8,10 +8,6 @@ import {
 
 export interface OpaqueOptions {
 	OPAQUE_SERVER_KEY: string;
-	sendRegistrationEmail: (
-		email: string,
-		type: "registration" | "already-registered",
-	) => Promise<void>;
 }
 
 export const REGISTRATION_REQUEST_LENGTH = 32;
