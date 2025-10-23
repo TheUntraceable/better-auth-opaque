@@ -31,7 +31,9 @@ export const opaque = (options?: OpaqueOptions) => {
 			);
 		});
 	}
-
+	if (options?.insecureCreateSessionOnRegister) {
+		console.log(`⚠️ WARNING: insecureCreateSessionOnRegister is enabled. This will automatically create a session upon registration, which could lead to user enumeration. Use with caution in production environments.`);
+	}
 	return {
 		id: "opaque",
 		init: async () => {
@@ -146,6 +148,17 @@ export const opaque = (options?: OpaqueOptions) => {
 							createdAt: now,
 							updatedAt: now,
 						});
+
+						if (options?.insecureCreateSessionOnRegister) {
+							const session = await ctx.context.internalAdapter.createSession(
+								user.id,
+								ctx,
+								false,
+							);
+							if (session) {
+								await setSessionCookie(ctx, { session, user });
+							}
+						}
 
 						ctx.context.logger.debug(
 							`[COMPLETE] User created - Total time: ${(performance.now() - startTime).toFixed(2)}ms`,

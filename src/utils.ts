@@ -8,6 +8,9 @@ import {
 
 export interface OpaqueOptions {
 	OPAQUE_SERVER_KEY: string;
+	// Purposely make this long and verbose to discourage the use of it.
+	// People who use it should understand the risks.
+	insecureCreateSessionOnRegister?: boolean;
 }
 
 export const REGISTRATION_REQUEST_LENGTH = 32;
