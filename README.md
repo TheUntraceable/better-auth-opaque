@@ -73,8 +73,7 @@ import { opaque } from "better-auth-opaque";
 // ... other imports (adapters, etc.)
 
 export const auth = BetterAuth({
-    adapter: YourAdapter(),
-    secret: process.env.AUTH_SECRET, // Used to encrypt user data when sent to the client for login
+    secret: process.env.AUTH_SECRET, // This is also used to encrypt user data sent to the client for login to persist state
     plugins: [
         // Add the OPAQUE plugin
         opaque({
@@ -82,6 +81,21 @@ export const auth = BetterAuth({
         }),
     ],
 });
+```
+
+```typescript
+// src/lib/auth-client.ts
+import { createAuthClient } from "better-auth/client";
+import { opaqueClient } from "better-auth-opaque";
+
+export const authClient = createAuthClient({
+    // Any config you already have,
+    plugins: [
+        opaqueClient()
+        // ... other plugins
+    ]
+});
+
 ```
 
 ## 3. Client-Side Implementation
