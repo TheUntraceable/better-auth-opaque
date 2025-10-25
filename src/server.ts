@@ -46,7 +46,7 @@ export const opaque = (options?: OpaqueOptions) => {
 						type: "string",
 						required: false,
 						unique: true,
-						validator: { input: z.base64url() },
+						validator: { input: z.string().base64url() },
 					},
 				},
 			},
@@ -57,8 +57,8 @@ export const opaque = (options?: OpaqueOptions) => {
 				{
 					method: "POST",
 					body: z.object({
-						email: z.email(),
-						registrationRequest: z.base64url(),
+						email: z.string().email(),
+						registrationRequest: z.string().base64url(),
 					}),
 				},
 				async (ctx) => {
@@ -99,9 +99,9 @@ export const opaque = (options?: OpaqueOptions) => {
 				{
 					method: "POST",
 					body: z.object({
-						email: z.email(),
+						email: z.string().email(),
 						name: z.string().min(1).max(100),
-						registrationRecord: z.base64url(),
+						registrationRecord: z.string().base64url(),
 					}),
 				},
 				async (ctx) => {
@@ -188,8 +188,8 @@ export const opaque = (options?: OpaqueOptions) => {
 				{
 					method: "POST",
 					body: z.object({
-						email: z.email(),
-						loginRequest: z.base64url(),
+						email: z.string().email(),
+						loginRequest: z.string().base64url(),
 					}),
 				},
 				async (ctx) => {
@@ -254,8 +254,8 @@ export const opaque = (options?: OpaqueOptions) => {
 				{
 					method: "POST",
 					body: z.object({
-						email: z.email(),
-						loginResult: z.base64url(),
+						email: z.string().email(),
+						loginResult: z.string().base64url(),
 						encryptedServerState: z.string(),
 						dontRememberMe: z.boolean().optional(),
 					}),
