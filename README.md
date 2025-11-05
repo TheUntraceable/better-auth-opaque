@@ -10,7 +10,7 @@ This plugin allows you to build authentication systems where the server **never*
 ## Key Features
 
 * **Zero-Knowledge:** The server remains completely ignorant of user passwords, fulfilling a core tenet of privacy-first design.
-* **Post-Breach Security:** User passwords cannot be cracked offline even if an attacker steals your entire database and server secrets.
+* **Post-Breach Security:** User passwords cannot be cracked offline even if an attacker steals your entire database.
 * **Built-in User Enumeration Protection:** The login and registration flow is designed to be constant-time, preventing attackers from discovering which emails are registered on your service.
 * **Seamless Integration:** Designed to work flawlessly within the Better Auth ecosystem.
 * **Client-Agnostic API:** Provides a clear, multi-stage API for any frontend (web, mobile, CLI) to interact with.
