@@ -1,6 +1,6 @@
 import { ready, server } from "@serenity-kit/opaque";
 import { APIError, type BetterAuthPlugin, type User } from "better-auth";
-import { createAuthEndpoint } from "better-auth/api";
+import { createAuthEndpoint, sessionMiddleware } from "better-auth/api";
 import { setSessionCookie } from "better-auth/cookies";
 import { generateRandomString } from "better-auth/crypto";
 import * as z from "zod";
@@ -315,6 +315,185 @@ export const opaque = (options?: OpaqueOptions) => {
 						user: {
 							id: user.id,
 						},
+					});
+				},
+			),
+
+			// Password Change Flow - Step 1: Verify current password
+			getChangePasswordChallenge: createAuthEndpoint(
+				"/change-password/opaque/challenge",
+				{
+					method: "POST",
+					body: z.object({
+						loginRequest: z.string().base64url(),
+					}),
+					use: [sessionMiddleware],
+				},
+				async (ctx) => {
+					const { loginRequest } = ctx.body;
+
+					if (!ctx.context.session) {
+						throw new APIError("UNAUTHORIZED", {
+							message: "You must be logged in to change your password",
+						});
+					}
+
+					const { user } = ctx.context.session;
+
+					validateBase64Length(
+						loginRequest,
+						LOGIN_REQUEST_LENGTH,
+						"login request",
+					);
+
+					const opaqueAccount = await findOpaqueAccount(ctx, user.id);
+
+					if (!opaqueAccount || !opaqueAccount.registrationRecord) {
+						throw new APIError("BAD_REQUEST", {
+							message: "No OPAQUE account found for this user",
+						});
+					}
+
+					const { loginResponse, serverLoginState } = server.startLogin({
+						userIdentifier: user.email,
+						startLoginRequest: loginRequest,
+						serverSetup: OPAQUE_SERVER_KEY,
+						registrationRecord: opaqueAccount.registrationRecord,
+					});
+
+					const encryptedServerState = await encryptServerLoginState(
+						serverLoginState,
+						ctx.context.secret,
+						user,
+					);
+
+					return { challenge: loginResponse, state: encryptedServerState };
+				},
+			),
+
+			// Password Change Flow - Step 2: Verify current password and get new password registration challenge
+			verifyCurrentPassword: createAuthEndpoint(
+				"/change-password/opaque/verify",
+				{
+					method: "POST",
+					body: z.object({
+						loginResult: z.string().base64url(),
+						encryptedServerState: z.string(),
+						registrationRequest: z.string().base64url(),
+					}),
+					use: [sessionMiddleware],
+				},
+				async (ctx) => {
+					const { loginResult, encryptedServerState, registrationRequest } = ctx.body;
+
+					if (!ctx.context.session) {
+						throw new APIError("UNAUTHORIZED", {
+							message: "You must be logged in to change your password",
+						});
+					}
+
+					const sessionUser = ctx.context.session.user;
+
+					validateBase64Length(
+						registrationRequest,
+						REGISTRATION_REQUEST_LENGTH,
+						"registration request",
+					);
+
+					let serverLoginState: string;
+					let user: User | null;
+
+					try {
+						({ serverLoginState, user } = await decryptServerLoginState(
+							encryptedServerState,
+							ctx.context.secret,
+						));
+					} catch {
+						throw new APIError("BAD_REQUEST", {
+							message: "Invalid login state",
+						});
+					}
+
+					// Verify the user in the encrypted state matches the session user
+					if (!user || user.id !== sessionUser.id) {
+						throw new APIError("UNAUTHORIZED", {
+							message: "Password verification failed",
+						});
+					}
+
+					const { sessionKey } = server.finishLogin({
+						finishLoginRequest: loginResult,
+						serverLoginState: serverLoginState,
+					});
+
+					if (!sessionKey) {
+						throw new APIError("UNAUTHORIZED", {
+							message: "Current password verification failed",
+						});
+					}
+
+					// Current password verified, now create registration challenge for new password
+					const { registrationResponse } = server.createRegistrationResponse({
+						userIdentifier: sessionUser.email,
+						registrationRequest,
+						serverSetup: OPAQUE_SERVER_KEY,
+					});
+
+					return { verified: true, challenge: registrationResponse };
+				},
+			),
+
+			// Password Change Flow - Step 3: Complete password change with new registration record
+			completeChangePassword: createAuthEndpoint(
+				"/change-password/opaque/complete",
+				{
+					method: "POST",
+					body: z.object({
+						registrationRecord: z.string().base64url(),
+					}),
+					use: [sessionMiddleware],
+				},
+				async (ctx) => {
+					const { registrationRecord } = ctx.body;
+
+					if (!ctx.context.session) {
+						throw new APIError("UNAUTHORIZED", {
+							message: "You must be logged in to change your password",
+						});
+					}
+
+					const user = ctx.context.session.user;
+
+					validateBase64LengthRange(
+						registrationRecord,
+						REGISTRATION_RECORD_MIN_LENGTH,
+						REGISTRATION_RECORD_MAX_LENGTH,
+						"registration record",
+					);
+
+					const opaqueAccount = await findOpaqueAccount(ctx, user.id);
+
+					if (!opaqueAccount) {
+						throw new APIError("BAD_REQUEST", {
+							message: "No OPAQUE account found for this user",
+						});
+					}
+
+					// Update the registration record with the new password
+					await ctx.context.internalAdapter.updateAccount(
+						opaqueAccount.id,
+						{
+							// @ts-ignore Ideally there should be a generic passed to updateAccount
+							// To allow the type but that's not the case, fix later with update method
+							// directly?
+							registrationRecord,
+							updatedAt: new Date(),
+						},
+					);
+
+					return ctx.json({
+						success: true,
+						message: "Password changed successfully",
 					});
 				},
 			),

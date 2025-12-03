@@ -6,6 +6,9 @@ type RegisterChallengeResponse = Awaited<ReturnType<ReturnType<typeof opaque>["e
 type LoginChallengeResponse = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["getLoginChallenge"]>>
 type RegisterComplete = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["completeRegistration"]>>
 type LoginComplete = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["completeLogin"]>>
+type ChangePasswordChallengeResponse = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["getChangePasswordChallenge"]>>
+type VerifyCurrentPasswordResponse = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["verifyCurrentPassword"]>>
+type CompleteChangePasswordResponse = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["completeChangePassword"]>>
 
 export const opaqueClient = () => {
 	return {
