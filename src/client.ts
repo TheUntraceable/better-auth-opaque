@@ -98,6 +98,79 @@ export const opaqueClient = () => {
 							},
 						});
 					}
+				},
+				changePassword: async ({ currentPassword, newPassword }: {
+					currentPassword: string;
+					newPassword: string;
+				}) => {
+					await ready;
+
+					// Step 1: Start login with current password to verify it
+					const { clientLoginState, startLoginRequest } = client.startLogin({
+						password: currentPassword,
+					});
+
+					const challengeResponse = await $fetch<ChangePasswordChallengeResponse>("/change-password/opaque/challenge", {
+						method: "POST",
+						body: {
+							loginRequest: startLoginRequest,
+						},
+					});
+
+					if (!challengeResponse.data || !challengeResponse.data.challenge) {
+						return { data: null, error: challengeResponse.error || { message: "Failed to get password change challenge" } };
+					}
+
+					const { challenge: loginResponse, state: encryptedServerState } = challengeResponse.data;
+
+					// Complete login with current password
+					const loginAttempt = client.finishLogin({
+						password: currentPassword,
+						clientLoginState,
+						loginResponse,
+					});
+
+					if (!loginAttempt) {
+						return { data: null, error: { message: "Current password verification failed" } };
+					}
+
+					const { finishLoginRequest: loginResult } = loginAttempt;
+
+					// Step 2: Start registration with new password
+					const { clientRegistrationState, registrationRequest } = client.startRegistration({
+						password: newPassword,
+					});
+
+					// Verify current password and get registration challenge for new password
+					const verifyResponse = await $fetch<VerifyCurrentPasswordResponse>("/change-password/opaque/verify", {
+						method: "POST",
+						body: {
+							loginResult,
+							encryptedServerState,
+							registrationRequest,
+						},
+					});
+
+					if (!verifyResponse.data || !verifyResponse.data.verified || !verifyResponse.data.challenge) {
+						return { data: null, error: verifyResponse.error || { message: "Current password verification failed" } };
+					}
+
+					const { challenge: registrationResponse } = verifyResponse.data;
+
+					// Step 3: Complete registration with new password
+					const { registrationRecord } = client.finishRegistration({
+						clientRegistrationState,
+						password: newPassword,
+						registrationResponse,
+					});
+
+					// Complete password change
+					return await $fetch<CompleteChangePasswordResponse>("/change-password/opaque/complete", {
+						method: "POST",
+						body: {
+							registrationRecord,
+						},
+					});
 				}
 			}
 		},
