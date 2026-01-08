@@ -425,7 +425,7 @@ export const opaque = (options?: OpaqueOptions) => {
 					}
 
 					// CRITICAL: Verify decrypted user matches the authenticated session user
-					// An attacher could steal this from any other request if we didn't verify
+					// An attacker could steal this from any other request if we didn't verify
 					if (!user || user.id !== ctx.context.session.user.id) {
 						throw new APIError("UNAUTHORIZED", {
 							message: "User mismatch",
