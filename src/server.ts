@@ -1,6 +1,6 @@
 import { ready, server } from "@serenity-kit/opaque";
 import { APIError, type BetterAuthPlugin, type User } from "better-auth";
-import { createAuthEndpoint } from "better-auth/api";
+import { createAuthEndpoint, sessionMiddleware } from "better-auth/api";
 import { setSessionCookie } from "better-auth/cookies";
 import { generateRandomString } from "better-auth/crypto";
 import * as z from "zod";
@@ -315,6 +315,167 @@ export const opaque = (options?: OpaqueOptions) => {
 						user: {
 							id: user.id,
 						},
+					});
+				},
+			),
+
+			getChangePasswordChallenge: createAuthEndpoint(
+				"/opaque/changePassword/challenge",
+				{
+					method: "POST",
+					requireHeaders: true,
+					body: z.object({
+						loginRequest: z.string().base64url(),
+						registrationRequest: z.string().base64url(),
+					}),
+					use: [sessionMiddleware]
+				},
+				async (ctx) => {
+					const { loginRequest, registrationRequest } = ctx.body;
+					const email = ctx.context.session.user.email;
+					validateBase64Length(
+						loginRequest,
+						LOGIN_REQUEST_LENGTH,
+						"login request",
+					);
+					validateBase64Length(
+						registrationRequest,
+						REGISTRATION_REQUEST_LENGTH,
+						"registration request",
+					);
+
+					const startTime = performance.now();
+
+					// Always perform OPAQUE operations to mitigate timing attacks
+					const opaqueAccount = await findOpaqueAccount(ctx, ctx.context.session.user.id);
+					let registrationRecord: string;
+					if (!opaqueAccount?.registrationRecord) {
+						// Use dummy record if no OPAQUE account exists
+						registrationRecord = await createDummyRegistrationRecord();
+					} else {
+						registrationRecord = opaqueAccount.registrationRecord;
+					}
+
+					// Step 1: Verify old password with login challenge (real or dummy)
+					const { loginResponse, serverLoginState } = server.startLogin({
+						userIdentifier: email,
+						startLoginRequest: loginRequest,
+						serverSetup: OPAQUE_SERVER_KEY,
+						registrationRecord,
+					});
+
+					// Step 2: Generate new password challenge
+					const { registrationResponse } = server.createRegistrationResponse({
+						userIdentifier: email,
+						registrationRequest,
+						serverSetup: OPAQUE_SERVER_KEY,
+					});
+
+					// Encrypt the server login state for verification in complete step
+					const encryptedServerState = await encryptServerLoginState(
+						serverLoginState,
+						ctx.context.secret,
+						ctx.context.session.user,
+					);
+
+					ctx.context.logger.debug(
+						`[CHANGE_PASSWORD] Total time: ${(performance.now() - startTime).toFixed(2)}ms`,
+					);
+
+					return {
+						loginChallenge: loginResponse,
+						registrationChallenge: registrationResponse,
+						state: encryptedServerState,
+					};
+				},
+			),
+
+			completeChangePassword: createAuthEndpoint(
+				"/opaque/changePassword/complete",
+				{
+					method: "POST",
+					requireHeaders: true,
+					body: z.object({
+						loginResult: z.string().base64url(),
+						registrationRecord: z.string().base64url(),
+						encryptedServerState: z.string(),
+					}),
+					use: [sessionMiddleware]
+				},
+				async (ctx) => {
+					const { loginResult, registrationRecord, encryptedServerState } =
+						ctx.body;
+
+					validateBase64LengthRange(
+						registrationRecord,
+						REGISTRATION_RECORD_MIN_LENGTH,
+						REGISTRATION_RECORD_MAX_LENGTH,
+						"registration record",
+					);
+					validateBase64LengthRange(
+						registrationRecord,
+						REGISTRATION_RECORD_MIN_LENGTH,
+						REGISTRATION_RECORD_MAX_LENGTH,
+						"registration record",
+					)
+					let serverLoginState: string;
+					let user: User | null;
+
+					try {
+						({ serverLoginState, user } = await decryptServerLoginState(
+							encryptedServerState,
+							ctx.context.secret,
+						));
+					} catch {
+						throw new APIError("BAD_REQUEST", {
+							message: "Invalid login state",
+						});
+					}
+
+					// CRITICAL: Verify decrypted user matches the authenticated session user
+					// An attacker could steal this from any other request if we didn't verify
+					if (!user || user.id !== ctx.context.session.user.id) {
+						throw new APIError("UNAUTHORIZED", {
+							message: "User mismatch",
+						});
+					}
+					const opaqueAccount = await findOpaqueAccount(ctx, ctx.context.session.user.id);
+					if (!opaqueAccount) {
+						throw new APIError("BAD_REQUEST", {
+							message: "No OPAQUE account found",
+						});
+					}
+					// Verify the old password
+					const { sessionKey } = server.finishLogin({
+						finishLoginRequest: loginResult,
+						serverLoginState: serverLoginState,
+					});
+
+					if (!sessionKey) {
+						throw new APIError("UNAUTHORIZED", {
+							message: "Invalid current password",
+						});
+					}
+
+					// Old password verified, now update to new password
+
+					await ctx.context.internalAdapter.updateAccount(
+						opaqueAccount.id,
+						{
+							registrationRecord,
+							updatedAt: new Date(),
+						} as Partial<typeof opaqueAccount>,
+					);
+					// Invalidate all sessions
+					await ctx.context.internalAdapter.deleteSessions(user.id)
+
+					ctx.context.logger.debug(
+						`[CHANGE_PASSWORD] Password changed successfully for ${ctx.context.session.user.email.substring(0, 20)}...`,
+					);
+
+					return ctx.json({
+						success: true,
+						message: "Password changed successfully",
 					});
 				},
 			),
