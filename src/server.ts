@@ -346,19 +346,22 @@ export const opaque = (options?: OpaqueOptions) => {
 
 					const startTime = performance.now();
 
+					// Always perform OPAQUE operations to mitigate timing attacks
 					const opaqueAccount = await findOpaqueAccount(ctx, ctx.context.session.user.id);
+					let registrationRecord: string;
 					if (!opaqueAccount?.registrationRecord) {
-						throw new APIError("BAD_REQUEST", {
-							message: "No OPAQUE account found",
-						});
+						// Use dummy record if no OPAQUE account exists
+						registrationRecord = await createDummyRegistrationRecord();
+					} else {
+						registrationRecord = opaqueAccount.registrationRecord;
 					}
 
-					// Step 1: Verify old password with login challenge
+					// Step 1: Verify old password with login challenge (real or dummy)
 					const { loginResponse, serverLoginState } = server.startLogin({
 						userIdentifier: email,
 						startLoginRequest: loginRequest,
 						serverSetup: OPAQUE_SERVER_KEY,
-						registrationRecord: opaqueAccount.registrationRecord,
+						registrationRecord,
 					});
 
 					// Step 2: Generate new password challenge
@@ -409,7 +412,12 @@ export const opaque = (options?: OpaqueOptions) => {
 						REGISTRATION_RECORD_MAX_LENGTH,
 						"registration record",
 					);
-
+					validateBase64LengthRange(
+						registrationRecord,
+						REGISTRATION_RECORD_MIN_LENGTH,
+						REGISTRATION_RECORD_MAX_LENGTH,
+						"registration record",
+					)
 					let serverLoginState: string;
 					let user: User | null;
 
@@ -431,7 +439,12 @@ export const opaque = (options?: OpaqueOptions) => {
 							message: "User mismatch",
 						});
 					}
-
+					const opaqueAccount = await findOpaqueAccount(ctx, ctx.context.session.user.id);
+					if (!opaqueAccount) {
+						throw new APIError("BAD_REQUEST", {
+							message: "No OPAQUE account found",
+						});
+					}
 					// Verify the old password
 					const { sessionKey } = server.finishLogin({
 						finishLoginRequest: loginResult,
@@ -445,12 +458,6 @@ export const opaque = (options?: OpaqueOptions) => {
 					}
 
 					// Old password verified, now update to new password
-					const opaqueAccount = await findOpaqueAccount(ctx, ctx.context.session.user.id);
-					if (!opaqueAccount) {
-						throw new APIError("BAD_REQUEST", {
-							message: "No OPAQUE account found",
-						});
-					}
 
 					await ctx.context.internalAdapter.updateAccount(
 						opaqueAccount.id,
@@ -459,6 +466,8 @@ export const opaque = (options?: OpaqueOptions) => {
 							updatedAt: new Date(),
 						} as Partial<typeof opaqueAccount>,
 					);
+					// Invalidate all sessions
+					await ctx.context.internalAdapter.deleteSessions(user.id)
 
 					ctx.context.logger.debug(
 						`[CHANGE_PASSWORD] Password changed successfully for ${ctx.context.session.user.email.substring(0, 20)}...`,
