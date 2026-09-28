@@ -1,4 +1,4 @@
-import type { BetterAuthClientPlugin } from "@better-auth/core";
+import type { BetterAuthClientPlugin } from "better-auth/client";
 import { client, ready } from "@serenity-kit/opaque";
 import type { opaque } from "./server";
 

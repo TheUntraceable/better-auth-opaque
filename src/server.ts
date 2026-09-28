@@ -138,7 +138,7 @@ export const opaque = (options?: OpaqueOptions) => {
 							name,
 							createdAt: now,
 							updatedAt: now,
-						});
+						}, { method: "email-password" });
 
 						await ctx.context.internalAdapter.createAccount({
 							accountId,
@@ -152,7 +152,6 @@ export const opaque = (options?: OpaqueOptions) => {
 						if (options?.insecureCreateSessionOnRegister) {
 							const session = await ctx.context.internalAdapter.createSession(
 								user.id,
-								ctx,
 								false,
 							);
 							if (session) {
@@ -298,7 +297,6 @@ export const opaque = (options?: OpaqueOptions) => {
 
 					const session = await ctx.context.internalAdapter.createSession(
 						user.id,
-						ctx,
 						dontRememberMe || false,
 					);
 					if (!session) {
@@ -467,7 +465,7 @@ export const opaque = (options?: OpaqueOptions) => {
 						} as Partial<typeof opaqueAccount>,
 					);
 					// Invalidate all sessions
-					await ctx.context.internalAdapter.deleteSessions(user.id)
+					await ctx.context.internalAdapter.deleteUserSessions(user.id)
 
 					ctx.context.logger.debug(
 						`[CHANGE_PASSWORD] Password changed successfully for ${ctx.context.session.user.email.substring(0, 20)}...`,

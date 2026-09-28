@@ -6,7 +6,6 @@ import { opaque } from "../src/server";
 
 
 const auth = betterAuth({
-	// database: mongodbAdapter(db),
 	emailAndPassword: {
 		enabled: true,
 	},
