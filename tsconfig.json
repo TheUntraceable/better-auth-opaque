@@ -12,10 +12,12 @@
 		"moduleResolution": "bundler",
 		"verbatimModuleSyntax": true,
 		"noEmit": false,
+		"rootDir": "./src",
 		"outDir": "./dist",
 		"declaration": true,
 		"declarationMap": true,
 		"sourceMap": true,
+		"types": ["bun"],
 
 		// Best practices
 		"strict": true,

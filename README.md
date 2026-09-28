@@ -43,6 +43,8 @@ npm install better-auth-opaque @serenity-kit/opaque
 yarn add better-auth-opaque @serenity-kit/opaque
 ```
 
+This plugin requires `better-auth` 1.7 or newer and `zod` 4 as peer dependencies, so make sure both are installed in your project.
+
 ## 2. Setup & Configuration
 
 ### Step 2.1: Set Environment Variables

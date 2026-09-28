@@ -138,7 +138,7 @@ export const opaque = (options?: OpaqueOptions) => {
 							name,
 							createdAt: now,
 							updatedAt: now,
-						});
+						}, { method: "email-password" });
 
 						await ctx.context.internalAdapter.createAccount({
 							accountId,
@@ -152,7 +152,6 @@ export const opaque = (options?: OpaqueOptions) => {
 						if (options?.insecureCreateSessionOnRegister) {
 							const session = await ctx.context.internalAdapter.createSession(
 								user.id,
-								ctx,
 								false,
 							);
 							if (session) {
@@ -298,7 +297,6 @@ export const opaque = (options?: OpaqueOptions) => {
 
 					const session = await ctx.context.internalAdapter.createSession(
 						user.id,
-						ctx,
 						dontRememberMe || false,
 					);
 					if (!session) {

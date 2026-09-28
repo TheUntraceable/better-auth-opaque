@@ -1,6 +1,6 @@
 {
 	"name": "better-auth-opaque",
-	"version": "2.0.3",
+	"version": "2.1.0",
 	"type": "module",
 	"main": "./dist/index.js",
 	"module": "./dist/index.js",
@@ -22,17 +22,20 @@
 	},
 	"devDependencies": {
 		"@types/bun": "latest",
-		"@types/express": "^5.0.3",
+		"@types/express": "^5.0.6",
 		"@types/morgan": "^1.9.10",
-		"express": "^5.1.0",
-		"mongodb": "^6.20.0",
-		"morgan": "^1.10.1"
+		"better-auth": "^1.7.6",
+		"express": "^5.2.1",
+		"morgan": "^1.12.1",
+		"typescript": "^7.0.2",
+		"zod": "^4.6.5"
 	},
 	"peerDependencies": {
-		"typescript": "^5"
+		"better-auth": "^1.7.0",
+		"typescript": ">=5",
+		"zod": "^4"
 	},
 	"dependencies": {
-		"@serenity-kit/opaque": "^0.9.0",
-		"better-auth": "^1.3.28"
+		"@serenity-kit/opaque": "^0.9.0"
 	}
 }
