@@ -465,7 +465,7 @@ export const opaque = (options?: OpaqueOptions) => {
 						} as Partial<typeof opaqueAccount>,
 					);
 					// Invalidate all sessions
-					await ctx.context.internalAdapter.deleteSessions(user.id)
+					await ctx.context.internalAdapter.deleteUserSessions(user.id)
 
 					ctx.context.logger.debug(
 						`[CHANGE_PASSWORD] Password changed successfully for ${ctx.context.session.user.email.substring(0, 20)}...`,
