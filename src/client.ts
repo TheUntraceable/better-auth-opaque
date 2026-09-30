@@ -75,13 +75,22 @@ export type OpaqueFetchOptions = Omit<BetterFetchOption, "body" | "method" | "pa
 
 type WithFetchOptions<T> = T & { fetchOptions?: OpaqueFetchOptions | undefined };
 
-export type SignUpOpaqueInput = WithFetchOptions<{
-	email: string;
-	name: string;
-	password: string;
-	/** Where the email verification link sends the user once verified. */
-	callbackURL?: string | undefined;
-}>;
+export type SignUpOpaqueInput = WithFetchOptions<
+	{
+		email: string;
+		name: string;
+		password: string;
+		image?: string | undefined;
+		/** Where the email verification link sends the user once verified. */
+		callbackURL?: string | undefined;
+	} & {
+		/**
+		 * Additional user fields (`user.additionalFields` with `input: true` on
+		 * the server), sent with the complete step as core's `signUp.email` does.
+		 */
+		[field: string]: unknown;
+	}
+>;
 
 export type SignInOpaqueInput = WithFetchOptions<{
 	email: string;
@@ -306,7 +315,7 @@ export const opaqueClient = (options?: OpaqueClientOptions) => {
 						data: SignUpOpaqueInput,
 						fetchOptions?: OpaqueFetchOptions,
 					): Promise<OpaqueClientResult<SignUpOpaqueData>> => {
-						const { email, name, password, callbackURL, fetchOptions: inline } = data;
+						const { email, name, password, fetchOptions: inline, ...fields } = data;
 						const f = flow(inline, fetchOptions);
 						await ready;
 						const { clientRegistrationState, registrationRequest } = client.startRegistration({ password });
@@ -321,11 +330,13 @@ export const opaqueClient = (options?: OpaqueClientOptions) => {
 							registrationResponse: challenge.data.challenge,
 							...stretch,
 						});
+						// `image`, `callbackURL` and additional user fields travel as given.
+						const extra = Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined));
 						const res = await f.finish<SignUpOpaqueData>("/sign-up/opaque/complete", {
+							...extra,
 							email,
 							name,
 							registrationRecord,
-							...(callbackURL === undefined ? {} : { callbackURL }),
 						});
 						// The server may have created a session (insecureCreateSessionOnRegister).
 						if (!res.error) f.notifySession();
