@@ -7,9 +7,9 @@ import {
 	symmetricDecrypt,
 	symmetricEncrypt,
 } from "better-auth/crypto";
-import { OPAQUE_ERROR_CODES } from "./error-codes";
+import { OPAQUE_ERROR_CODES } from "./error-codes.js";
 
-export { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "./error-codes";
+export { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "./error-codes.js";
 
 export interface OpaqueOptions {
 	/**

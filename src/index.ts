@@ -19,7 +19,7 @@ export {
 	type SignUpOpaqueData,
 	type SignUpOpaqueInput,
 	type StatusData,
-} from "./client";
-export { opaque } from "./server";
-export { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "./error-codes";
-export type { OpaqueOptions } from "./utils";
+} from "./client.js";
+export { opaque } from "./server.js";
+export { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "./error-codes.js";
+export type { OpaqueOptions } from "./utils.js";

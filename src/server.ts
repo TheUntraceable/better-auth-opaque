@@ -50,9 +50,10 @@ import {
 	timingSafeEqualString,
 	validateBase64Length,
 	validateBase64LengthRange,
-} from "./utils";
+} from "./utils.js";
 
-export { OPAQUE_ERROR_CODES } from "./utils";
+export { OPAQUE_ERROR_CODES } from "./utils.js";
+export type { OpaqueErrorCode, OpaqueOptions } from "./utils.js";
 
 type ErrorEntry = { code: string; message: string };
 
