@@ -3,11 +3,13 @@ import { describe, expect, test } from "bun:test";
 import {
 	createTestHarness,
 	type Device,
+	pauseWriteAfterAccountRead,
 	randomBase64Url,
 	SESSION_DATA_COOKIE,
 	SESSION_TOKEN_COOKIE,
 	startChangePassword,
 	startLogin,
+	startResetPassword,
 	uniqueEmail,
 	validLoginPayload,
 } from "./helpers/harness";
@@ -409,5 +411,46 @@ describe("change password: session token rotation", () => {
 		expect(tokenCookie).toBeDefined();
 		expect(changer.sessionToken()).not.toBe(before!);
 		expect(Number(tokenCookie!.attributes["max-age"])).toBeGreaterThan(0);
+	});
+});
+
+describe("change password: a reset that lands between the digest check and the write", () => {
+	test("the change is 401 INVALID_CURRENT_PASSWORD, creates no session, and the reset's password is the one that works", async () => {
+		const pause = pauseWriteAfterAccountRead();
+		const hr = await createTestHarness({ resetOTP: true, onAdapterCall: pause.onAdapterCall });
+		const email = uniqueEmail("chpw-vs-reset");
+		await hr.register(email, OLD_PASSWORD);
+		const changer = await hr.loggedInDevice(email, OLD_PASSWORD);
+		const change = await startChangePassword(changer, OLD_PASSWORD, "changed password");
+		await hr.device().post("/opaque/forget-password", { email, method: "otp" });
+		const otp = hr.outbox.resetOTPsFor(email).at(-1)!.otp;
+		const reset = await startResetPassword(hr.device(), { email, otp }, "reset password");
+		expect(reset.res.status).toBe(200);
+
+		pause.arm();
+		const changeRes = changer.post("/opaque/change-password/complete", {
+			loginResult: change.loginResult,
+			registrationRecord: change.registrationRecord,
+			encryptedServerState: change.encryptedServerState,
+		});
+		await pause.paused; // the change has checked the record digest and is about to write
+		const resetRes = await hr.device().post("/opaque/reset-password/complete", {
+			email,
+			otp,
+			registrationRecord: reset.registrationRecord,
+		});
+		expect(resetRes.status).toBe(200);
+		const sessionsAfterReset = await hr.db.sessionCount();
+		pause.release();
+		const res = await changeRes;
+
+		expect({ status: res.status, code: res.body?.code }).toEqual({ status: 401, code: "INVALID_CURRENT_PASSWORD" });
+		expect(res.setCookies.map((c) => c.name)).not.toContain(SESSION_TOKEN_COOKIE);
+		expect(await hr.db.sessionCount()).toBe(sessionsAfterReset);
+		expect(await hr.db.registrationRecord(email)).toBe(reset.registrationRecord!);
+		const login = async (password: string) => !(await hr.device().client.signIn.opaque({ email, password })).error;
+		expect(await login("reset password")).toBe(true);
+		expect(await login("changed password")).toBe(false);
+		expect(await login(OLD_PASSWORD)).toBe(false);
 	});
 });

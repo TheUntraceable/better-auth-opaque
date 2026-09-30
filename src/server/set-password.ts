@@ -20,13 +20,14 @@ import {
 } from "../utils.js";
 import {
 	assertStorableRegistrationRecord,
-	convergeOpaqueAccounts,
 	createOpaqueAccount,
+	deleteExpiredVerificationRows,
 	findOpaqueAccount,
 	HIDDEN_FROM_CLIENT,
 	type OpaqueDeps,
 	purgeOutstandingCredentials,
 	registrationResponseOr400,
+	yieldToOtherOpaqueWriters,
 } from "./shared.js";
 
 const alreadyExists = () =>
@@ -69,6 +70,8 @@ export function setPasswordEndpoints(deps: OpaqueDeps) {
 					registrationRequest,
 				);
 
+				// Housekeeping on an authenticated path (see deleteExpiredVerificationRows).
+				await deleteExpiredVerificationRows(ctx);
 				const identifier = setPasswordIdentifier(sessionUser.id);
 				await ctx.context.internalAdapter.deleteVerificationByIdentifier(identifier);
 				await ctx.context.internalAdapter.createVerificationValue({
@@ -132,8 +135,15 @@ export function setPasswordEndpoints(deps: OpaqueDeps) {
 					await purgeOutstandingCredentials(ctx, sessionUser);
 					return account;
 				});
-				// A concurrent password reset may have created one too.
-				await convergeOpaqueAccounts(ctx, userId, created.id, credential);
+				// A concurrent password reset may have written one too: the reset
+				// has priority, and this request reports that an account exists.
+				if (await yieldToOtherOpaqueWriters(ctx, userId, created.id, registrationRecord)) {
+					throw alreadyExists();
+				}
+				// Only report success if our record is the one that is stored now
+				// (a reset may have replaced it in place).
+				const stored = await findOpaqueAccount(ctx, userId);
+				if (stored?.registrationRecord !== registrationRecord) throw alreadyExists();
 
 				return ctx.json({ status: true });
 			},

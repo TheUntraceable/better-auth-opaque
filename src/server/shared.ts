@@ -21,6 +21,7 @@ import {
 	generateNonce,
 	hasBase64LengthInRange,
 	isDeserializableRegistrationRecord,
+	isExpired,
 	KEY_LABELS,
 	type KeyLabel,
 	keyedHash,
@@ -34,6 +35,7 @@ import {
 	REGISTRATION_RECORD_MAX_LENGTH,
 	REGISTRATION_RECORD_MIN_LENGTH,
 	RESET_TOKEN_IDENTIFIER_PREFIX,
+	resetInFlightIdentifier,
 	resetOTPIdentifier,
 	type ServerLoginStatePayload,
 	undecodableInput,
@@ -101,6 +103,17 @@ export async function recordDigest(
  */
 export function opaqueIdentifier(account: OpaqueAccount | undefined, email: string): string {
 	const stored = account?.accountId;
+	// Legacy heuristic: an `accountId` containing "@" is taken to be the
+	// identifier the record was registered under (every version that stores
+	// the identifier stores a normalised email, which always has an "@");
+	// anything else (earlier versions' generated ids, or no account at all)
+	// falls back to the user's CURRENT email. Limits: the fallback is only
+	// right for a legacy record whose user has not changed their email since
+	// it was registered (after a change, the password stops verifying until
+	// it is reset, which rewrites `accountId`); and a legacy `accountId` that
+	// happens to contain "@" (e.g. hand-migrated rows) would be trusted as the
+	// identifier. Rows are never rewritten here: a successful reset, change or
+	// set-password stores the identifier explicitly.
 	return typeof stored === "string" && stored.includes("@") ? stored : normalizeEmail(email);
 }
 
@@ -418,31 +431,46 @@ export async function updateOpaqueRecord(
 }
 
 /**
- * Stores a credential as the user's OPAQUE password: into the canonical
- * account, or a new one. Returns the account id written.
+ * Compare-and-swap of an OPAQUE account's record: replaces it (and its
+ * identifier) only if the stored record is still `expectedRecord`, the one
+ * the caller checked its credential against. Returns whether a row was
+ * written. One conditional `updateMany` (`id = ? AND registrationRecord = ?`),
+ * atomic on every database; inside `runWithTransaction` it joins the
+ * transaction. Being a raw adapter write, it runs no `databaseHooks`.
  */
-export async function writeOpaqueRecord(
+export async function swapOpaqueRecord(
 	ctx: GenericEndpointContext,
-	userId: string,
+	accountId: string,
+	expectedRecord: string | null | undefined,
 	credential: OpaqueCredential,
-): Promise<string> {
-	const existing = await findOpaqueAccount(ctx, userId);
-	if (existing) {
-		await updateOpaqueRecord(ctx, existing.id, credential);
-		return existing.id;
-	}
-	return (await createOpaqueAccount(ctx, userId, credential)).id;
+): Promise<boolean> {
+	const adapter = await getCurrentAdapter(ctx.context.adapter);
+	const updated = await adapter.updateMany({
+		model: "account",
+		where: [
+			{ field: "id", value: accountId },
+			{ field: "registrationRecord", value: expectedRecord ?? null },
+		],
+		update: {
+			accountId: credential.identifier,
+			registrationRecord: credential.registrationRecord,
+			updatedAt: new Date(),
+		},
+	});
+	return updated > 0;
 }
 
 /**
- * Converges concurrent password writers (two resets, a reset and a
- * set-password, ...) on exactly one OPAQUE account. The adapter cannot
- * enforce "one opaque account per user", so every writer, AFTER its own
- * write is committed, lists the user's OPAQUE accounts; the canonical one
- * (oldest by `createdAt`, then `id`) is kept. A writer whose account is not
- * canonical moves its record into the canonical account; every non-canonical
- * account is deleted. Whichever writer lists last sees every account and
- * leaves exactly one; its record is one of the writers' records.
+ * Converges concurrent password resets (of a user who had no OPAQUE
+ * account) on exactly one OPAQUE account. The adapter cannot enforce "one
+ * opaque account per user", so every such writer, AFTER its own account is
+ * committed, lists the user's OPAQUE accounts; the canonical one (oldest by
+ * `createdAt`, then `id`) is kept. A writer whose account is not canonical
+ * moves its record into the canonical account (a compare-and-swap: if the
+ * canonical account changed or disappeared meanwhile, it lists again); every
+ * non-canonical account is deleted. Whichever writer lists last sees every
+ * account and leaves exactly one; its record is one of the writers' records.
+ * A concurrent set-password yields to resets (`yieldToOtherOpaqueWriters`).
  *
  * Must run outside a transaction, so that it sees the other writers' rows.
  */
@@ -452,17 +480,83 @@ export async function convergeOpaqueAccounts(
 	ourAccountId: string,
 	credential: OpaqueCredential,
 ): Promise<void> {
-	const accounts = await findOpaqueAccounts(ctx, userId);
-	const canonical = canonicalAccount(accounts);
-	if (!canonical) return;
-	if (canonical.id !== ourAccountId && accounts.some((a) => a.id === ourAccountId)) {
-		await updateOpaqueRecord(ctx, canonical.id, credential);
-	}
-	for (const account of accounts) {
-		if (account.id !== canonical.id) {
-			await ctx.context.internalAdapter.deleteAccount(account.id);
+	for (let attempt = 0; attempt < 5; attempt++) {
+		const accounts = await findOpaqueAccounts(ctx, userId);
+		const canonical = canonicalAccount(accounts);
+		if (!canonical) return;
+		if (
+			canonical.id !== ourAccountId &&
+			accounts.some((a) => a.id === ourAccountId) &&
+			!(await swapOpaqueRecord(ctx, canonical.id, canonical.registrationRecord, credential))
+		) {
+			continue;
 		}
+		for (const account of accounts) {
+			if (account.id !== canonical.id) {
+				await ctx.context.internalAdapter.deleteAccount(account.id);
+			}
+		}
+		return;
 	}
+}
+
+/**
+ * For set-password, which yields to every concurrent password writer (a
+ * reset has priority). Runs after its own account is committed; returns
+ * whether it yielded (then the request is a 400).
+ *
+ * - A reset of the user is in flight (its marker, written before the reset
+ *   checks its credential's binding, exists): our account is deleted if it
+ *   still holds our record (compare-and-delete; if the reset already wrote
+ *   into it, it is left alone). Either the reset saw no account when it
+ *   checked, and it writes its own, or it saw ours and fails.
+ * - Another OPAQUE account exists: ours is deleted or, when it is the
+ *   canonical one (which concurrent resets copy their record into, so it
+ *   must survive), it takes over the other writer's record and the others
+ *   are deleted.
+ *
+ * A reset whose binding check ran before our account was committed wrote
+ * its marker before that commit, so it is seen here: either its marker or
+ * (once it has finished) its record. Must run outside a transaction.
+ */
+export async function yieldToOtherOpaqueWriters(
+	ctx: GenericEndpointContext,
+	userId: string,
+	ourAccountId: string,
+	ourRecord: string,
+): Promise<boolean> {
+	const inFlight = await ctx.context.internalAdapter.findVerificationValue(
+		resetInFlightIdentifier(userId),
+	);
+	if (inFlight && !isExpired(inFlight)) {
+		const adapter = await getCurrentAdapter(ctx.context.adapter);
+		await adapter.deleteMany({
+			model: "account",
+			where: [
+				{ field: "id", value: ourAccountId },
+				{ field: "registrationRecord", value: ourRecord },
+			],
+		});
+		return true;
+	}
+	const accounts = await findOpaqueAccounts(ctx, userId);
+	const others = accounts.filter((account) => account.id !== ourAccountId);
+	const theirs = canonicalAccount(others);
+	if (!theirs) return false;
+	if (canonicalAccount(accounts)?.id !== ourAccountId) {
+		await ctx.context.internalAdapter.deleteAccount(ourAccountId);
+		return true;
+	}
+	if (typeof theirs.registrationRecord === "string") {
+		await updateOpaqueRecord(ctx, ourAccountId, {
+			registrationRecord: theirs.registrationRecord,
+			identifier: theirs.accountId,
+		});
+	}
+	for (const account of others) {
+		await ctx.context.internalAdapter.deleteAccount(account.id);
+	}
+	return true;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -515,6 +609,24 @@ export async function purgeOutstandingCredentials(
 	}
 }
 
+/**
+ * Deletes every expired verification row (as core's `findVerificationValue`
+ * does, and honouring `verification.disableCleanup`), e.g. challenge nonces
+ * that were never completed. Called only on authenticated or rate-limited,
+ * rarely used paths (change-password and set-password challenges,
+ * forget-password), never on the unauthenticated sign-in challenge, whose
+ * cost must not depend on the table. No-op when verification rows live only
+ * in secondary storage (they expire there by TTL).
+ */
+export async function deleteExpiredVerificationRows(ctx: GenericEndpointContext): Promise<void> {
+	if (!verificationRowsInDatabase(ctx) || ctx.context.options.verification?.disableCleanup) return;
+	const adapter = await getCurrentAdapter(ctx.context.adapter);
+	await adapter.deleteMany({
+		model: "verification",
+		where: [{ field: "expiresAt", operator: "lt", value: new Date() }],
+	});
+}
+
 /* ------------------------------------------------------------------------- */
 /*                             Email verification                            */
 /* ------------------------------------------------------------------------- */
@@ -547,7 +659,21 @@ export async function sendVerificationEmail(
 		ctx.context.options.emailVerification?.expiresIn,
 	);
 	const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(callbackURL || "/")}`;
-	await ctx.context.runInBackgroundOrAwait(send({ user, url, token }, cloneRequest(ctx.request)));
+	await runEmailCallback(ctx, () => send({ user, url, token }, cloneRequest(ctx.request)));
+}
+
+/**
+ * Runs an app-supplied email callback through `runInBackgroundOrAwait`
+ * (awaited, or handed to `advanced.backgroundTasks`), which logs a failure
+ * at error level instead of failing the request. The call itself is
+ * deferred into the promise, so a callback that throws synchronously is
+ * handled the same way: the response never depends on whether it threw.
+ */
+export async function runEmailCallback(
+	ctx: GenericEndpointContext,
+	callback: () => unknown,
+): Promise<void> {
+	await ctx.context.runInBackgroundOrAwait(Promise.resolve().then(callback));
 }
 
 /* ------------------------------------------------------------------------- */

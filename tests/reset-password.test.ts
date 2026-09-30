@@ -764,6 +764,70 @@ describe("reset with OTP", () => {
 
 /* ------------------------------ client flows ------------------------------ */
 
+describe("reset with OTP: a correct code at the challenge step is only read, never consumed and restored", () => {
+	/** Every create / delete of an OTP verification row, via databaseHooks. */
+	const otpRowEvents: Array<{ op: "create" | "delete"; value: string }> = [];
+	const isOTPRow = (row: { identifier?: string } | null | undefined) =>
+		typeof row?.identifier === "string" && row.identifier.startsWith("opaque-reset-otp:");
+	const hHooks = createTestHarness({
+		resetOTP: true,
+		authOptions: {
+			databaseHooks: {
+				verification: {
+					create: {
+						before: async (row) => {
+							if (isOTPRow(row)) otpRowEvents.push({ op: "create", value: String(row.value) });
+						},
+					},
+					delete: {
+						before: async (row) => {
+							if (isOTPRow(row)) otpRowEvents.push({ op: "delete", value: String(row.value) });
+						},
+					},
+				},
+			},
+		},
+	});
+
+	test("correct code: no delete / consume and no re-create of the OTP row; a wrong code does count an attempt (consume + restore)", async () => {
+		const hh = await hHooks;
+		const { email } = await opaqueUser(hh, "rp-otp-read");
+		const { otp } = await requestOTP(hh, email);
+
+		otpRowEvents.length = 0;
+		expect((await challenge(hh, { email, otp })).status).toBe(200);
+		expect((await challenge(hh, { email, otp })).status).toBe(200);
+		expect(otpRowEvents).toEqual([]);
+
+		const wrong = otp === "000000" ? "111111" : "000000";
+		expectCode(await challenge(hh, { email, otp: wrong }), 400, "INVALID_TOKEN");
+		expect(otpRowEvents.map((e) => e.op)).toEqual(["delete", "create"]);
+		expect(otpRowEvents[1]!.value).not.toBe(otpRowEvents[0]!.value); // one more attempt recorded
+
+		// The code still works after the wrong guess.
+		expect((await rawResetPassword(hh.device(), { email, otp }, NEW_PASSWORD)).complete.status).toBe(200);
+	});
+
+	test("a correct challenge and a correct complete fired concurrently: the complete succeeds", async () => {
+		const hh = await hHooks;
+		for (let round = 0; round < 3; round++) {
+			const { email } = await opaqueUser(hh, "rp-otp-concurrent");
+			const { otp } = await requestOTP(hh, email);
+			const started = await startResetPassword(hh.device(), { email, otp }, NEW_PASSWORD);
+			expect(started.res.status).toBe(200);
+
+			const [ch, done] = await Promise.all([
+				challenge(hh, { email, otp }),
+				complete(hh, { email, otp }, started.registrationRecord!),
+			]);
+
+			expect({ round, complete: done.status }).toEqual({ round, complete: 200 });
+			expect([200, 400]).toContain(ch.status);
+			expect(await canLogIn(hh, email, NEW_PASSWORD)).toBe(true);
+		}
+	});
+});
+
 describe("reset password: client", () => {
 	test("link: forgetPassword → resetPassword({ token, newPassword }) → signIn with the new password", async () => {
 		const { email } = await opaqueUser(hLink, "rp-client-link", 1);

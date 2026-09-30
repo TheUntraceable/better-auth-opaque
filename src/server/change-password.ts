@@ -15,6 +15,7 @@ import {
 	assertRecordUnchanged,
 	assertStorableRegistrationRecord,
 	consumeChallengeState,
+	deleteExpiredVerificationRows,
 	findOpaqueAccount,
 	finishLoginOr401,
 	HIDDEN_FROM_CLIENT,
@@ -25,7 +26,7 @@ import {
 	recordDigest,
 	registrationResponseOr400,
 	startLoginSafely,
-	updateOpaqueRecord,
+	swapOpaqueRecord,
 } from "./shared.js";
 
 export function changePasswordEndpoints(deps: OpaqueDeps) {
@@ -84,6 +85,8 @@ export function changePasswordEndpoints(deps: OpaqueDeps) {
 					userIdentifier,
 					registrationRequest,
 				);
+				// Housekeeping on an authenticated path (see deleteExpiredVerificationRows).
+				await deleteExpiredVerificationRows(ctx);
 				const state = await issueChallengeState(
 					ctx,
 					"change-password",
@@ -160,7 +163,12 @@ export function changePasswordEndpoints(deps: OpaqueDeps) {
 					ctx.context.secret,
 				));
 				const newSession = await runWithTransaction(ctx.context.adapter, async () => {
-					await updateOpaqueRecord(ctx, account.id, credential);
+					// Compare-and-swap on the record the proof was checked against: a
+					// reset that landed since the check wins, and this change is a 401
+					// (the transaction rolls back; no session is created).
+					if (!(await swapOpaqueRecord(ctx, account.id, account.registrationRecord, credential))) {
+						throw APIError.from("UNAUTHORIZED", credentialError);
+					}
 					await purgeOutstandingCredentials(ctx, user);
 					// Rotate the caller's session (a new token for a new password):
 					// the session that made the request is always deleted, and with

@@ -16,12 +16,15 @@ import {
 	createResetToken,
 	decodeResetOTPRecord,
 	encodeResetOTPRecord,
+	type ResetOTPRecord,
 	hashResetOTP,
 	isExpired,
 	KEY_LABELS,
 	normalizeEmail,
 	OPAQUE_ERROR_CODES,
 	REGISTRATION_REQUEST_LENGTH,
+	RESET_IN_FLIGHT_TTL_MS,
+	resetInFlightIdentifier,
 	resetOTPIdentifier,
 	resetTokenBinding,
 	resetTokenIdentifier,
@@ -30,15 +33,19 @@ import {
 import {
 	assertStorableRegistrationRecord,
 	convergeOpaqueAccounts,
+	createOpaqueAccount,
+	deleteExpiredVerificationRows,
 	findOpaqueAccount,
 	HIDDEN_FROM_CLIENT,
 	keyFor,
+	type OpaqueAccount,
 	type OpaqueDeps,
 	phantomUserId,
 	purgeOutstandingCredentials,
 	registrationResponseOr400,
 	resetBinding,
-	writeOpaqueRecord,
+	runEmailCallback,
+	swapOpaqueRecord,
 } from "./shared.js";
 
 type ResetCredential =
@@ -63,37 +70,55 @@ function parseResetCredential(body: {
 	throw invalidToken();
 }
 
-/** Whether `binding` is what the user's current email and record would get now. */
-async function bindingIsCurrent(
+/**
+ * The user's OPAQUE account (the record the binding was checked against),
+ * provided `binding` is what the user's current email and record would get
+ * now; otherwise `false`.
+ */
+async function checkBinding(
 	ctx: GenericEndpointContext,
 	user: User,
 	binding: string,
-): Promise<boolean> {
+): Promise<{ account: OpaqueAccount | undefined } | false> {
 	const account = await findOpaqueAccount(ctx, user.id);
 	const expected = await resetBinding(ctx, user, account?.registrationRecord);
-	return constantTimeEqual(expected, binding);
+	return constantTimeEqual(expected, binding) ? { account } : false;
+}
+
+/** The user a reset credential was issued for, and their OPAQUE account when it was checked. */
+interface VerifiedReset {
+	user: User;
+	account: OpaqueAccount | undefined;
 }
 
 /**
- * Checks a reset credential and returns the user it was issued for. Every
+ * Checks a reset credential and returns the user it was issued for (and
+ * the OPAQUE account its binding was checked against). Every
  * failure is 400 INVALID_TOKEN.
  *
  * Link token: looked up by its keyed hash; consumed (atomically) only when
  * `consume` is set; its binding must be current.
  *
- * OTP: the stored row is taken with an atomic consume, which serialises
- * concurrent guesses (a racer finds nothing and is rejected). A wrong code
- * puts the row back with one more attempt counted, unless that was the last
- * allowed attempt: then the row stays deleted. A correct code puts it back
- * unchanged unless `consume` is set. A locked code is indistinguishable from
- * an unknown one.
+ * OTP: without `consume` (challenge step) the row is first only read, and
+ * a correct code (constant-time comparison) is accepted without any write,
+ * so a concurrent complete always finds it. Otherwise (the complete step,
+ * or a guess that did not match) the row is taken with an atomic consume,
+ * which serialises concurrent guesses (a racer finds nothing and is
+ * rejected). A wrong code puts the row back with one more attempt counted,
+ * unless that was the last allowed attempt: then the row stays deleted. A
+ * correct code is consumed at the complete step. A locked code is
+ * indistinguishable from an unknown one.
+ *
+ * `beforeBindingCheck` runs once the credential is known to be valid for a
+ * user, before the binding is checked against their current record.
  */
 async function verifyResetCredential(
 	ctx: GenericEndpointContext,
 	deps: OpaqueDeps,
 	credential: ResetCredential,
 	consume: boolean,
-): Promise<User> {
+	beforeBindingCheck?: (userId: string) => Promise<void>,
+): Promise<VerifiedReset> {
 	const adapter = ctx.context.internalAdapter;
 	if (credential.kind === "token") {
 		const binding = resetTokenBinding(credential.token);
@@ -106,19 +131,50 @@ async function verifyResetCredential(
 			? await adapter.consumeVerificationValue(identifier)
 			: await adapter.findVerificationValue(identifier);
 		if (!row || isExpired(row)) throw invalidToken();
+		await beforeBindingCheck?.(row.value);
 		const user = await adapter.findUserById(row.value);
-		if (!user || !(await bindingIsCurrent(ctx, user, binding))) throw invalidToken();
-		return user;
+		const checked = user && (await checkBinding(ctx, user, binding));
+		if (!user || !checked) throw invalidToken();
+		return { user, account: checked.account };
 	}
 
 	const otpKey = await keyFor(ctx, KEY_LABELS.resetOTP);
 	const identifier = await resetOTPIdentifier(otpKey, credential.email);
 	// Hash first so a missing row costs the same as a present one.
 	const submittedHash = await hashResetOTP(otpKey, credential.email, credential.otp);
+	const { allowedAttempts } = deps.options.resetOTP;
+	/** The user of a correct code, provided the code was sent to their current email and record. */
+	const userOfCorrectCode = async (record: ResetOTPRecord): Promise<VerifiedReset | undefined> => {
+		if (consume) await beforeBindingCheck?.(record.userId);
+		const user = await adapter.findUserById(record.userId);
+		const checked =
+			user &&
+			normalizeEmail(user.email) === credential.email &&
+			(await checkBinding(ctx, user, record.binding));
+		return user && checked ? { user, account: checked.account } : undefined;
+	};
+
+	if (!consume) {
+		// Challenge step: a correct code is only read (constant-time
+		// comparison), so it never disappears under a concurrent complete.
+		const found = await adapter.findVerificationValue(identifier);
+		if (!found || isExpired(found)) throw invalidToken();
+		const current = decodeResetOTPRecord(found.value);
+		if (
+			current &&
+			current.attempts < allowedAttempts &&
+			constantTimeEqual(current.otpHash, submittedHash)
+		) {
+			const verified = await userOfCorrectCode(current);
+			if (!verified) throw invalidToken();
+			return verified;
+		}
+		// Not a correct code: counted below, like a guess at the complete step.
+	}
+
 	const row = await adapter.consumeVerificationValue(identifier);
 	if (!row) throw invalidToken();
 	const record = decodeResetOTPRecord(row.value);
-	const { allowedAttempts } = deps.options.resetOTP;
 	if (!record || record.attempts >= allowedAttempts) throw invalidToken();
 	const restore = (attempts: number) =>
 		adapter.createVerificationValue({
@@ -132,17 +188,13 @@ async function verifyResetCredential(
 		if (attempts < allowedAttempts) await restore(attempts);
 		throw invalidToken();
 	}
-	const user = await adapter.findUserById(record.userId);
-	if (
-		!user ||
-		normalizeEmail(user.email) !== credential.email ||
-		!(await bindingIsCurrent(ctx, user, record.binding))
-	) {
-		// Superseded: stays deleted.
-		throw invalidToken();
-	}
+	const verified = await userOfCorrectCode(record);
+	// Superseded: stays deleted.
+	if (!verified) throw invalidToken();
+	// (A code that only matched after a concurrent change of the row, at the
+	// challenge step, is put back unchanged.)
 	if (!consume) await restore(record.attempts);
-	return user;
+	return verified;
 }
 
 export function resetPasswordEndpoints(deps: OpaqueDeps) {
@@ -188,6 +240,9 @@ export function resetPasswordEndpoints(deps: OpaqueDeps) {
 				const method = resolveResetMethod(ctx.body.method);
 				const email = normalizeEmail(ctx.body.email);
 				const adapter = ctx.context.internalAdapter;
+				// Housekeeping on a rate-limited, rarely used path, for known and
+				// unknown emails alike (see deleteExpiredVerificationRows).
+				await deleteExpiredVerificationRows(ctx);
 				const found = await adapter.findUserByEmail(email);
 				// Same account lookup for unknown emails.
 				const account = await findOpaqueAccount(ctx, found?.user.id ?? phantomUserId(ctx));
@@ -223,7 +278,7 @@ export function resetPasswordEndpoints(deps: OpaqueDeps) {
 					});
 					const callbackURL = encodeURIComponent(ctx.body.redirectTo || "/");
 					const url = `${ctx.context.baseURL}/opaque/reset-password/${token}?callbackURL=${callbackURL}`;
-					await ctx.context.runInBackgroundOrAwait(
+					await runEmailCallback(ctx, () =>
 						raw.sendResetPassword?.({ user: found.user, url, token }, cloneRequest(ctx.request)),
 					);
 					return ctx.json(response);
@@ -249,7 +304,7 @@ export function resetPasswordEndpoints(deps: OpaqueDeps) {
 					}),
 					expiresAt: new Date(Date.now() + deps.options.resetOTP.expiresIn * 1000),
 				});
-				await ctx.context.runInBackgroundOrAwait(
+				await runEmailCallback(ctx, () =>
 					raw.sendResetPasswordOTP?.({ user: found.user, otp }, cloneRequest(ctx.request)),
 				);
 				return ctx.json(response);
@@ -311,7 +366,7 @@ export function resetPasswordEndpoints(deps: OpaqueDeps) {
 					REGISTRATION_REQUEST_LENGTH,
 					OPAQUE_ERROR_CODES.INVALID_REGISTRATION_REQUEST,
 				);
-				const user = await verifyResetCredential(ctx, deps, credential, false);
+				const { user } = await verifyResetCredential(ctx, deps, credential, false);
 				const challenge = registrationResponseOr400(
 					deps,
 					ctx.context.logger,
@@ -348,31 +403,81 @@ export function resetPasswordEndpoints(deps: OpaqueDeps) {
 				// consumes it nor counts as an OTP attempt.
 				assertStorableRegistrationRecord(deps, registrationRecord);
 
-				// Consumed outside the transaction: the atomic consume is the
-				// gate between concurrent completes.
-				const user = await verifyResetCredential(ctx, deps, credential, true);
 				const adapter = ctx.context.internalAdapter;
-
-				// Re-registered under the current email (the challenge step's
-				// identifier; the credential's binding guarantees it is unchanged).
-				const newCredential = { registrationRecord, identifier: normalizeEmail(user.email) };
-
-				const accountId = await runWithTransaction(ctx.context.adapter, async () => {
-					const id = await writeOpaqueRecord(ctx, user.id, newCredential);
-					// Following the emailed link/code proved control of the mailbox.
-					if (!user.emailVerified) {
-						await adapter.updateUser(user.id, { emailVerified: true });
-					}
-					await adapter.deleteUserSessions(user.id);
-					await purgeOutstandingCredentials(ctx, user);
-					return id;
-				});
-				// After commit: never leave two OPAQUE accounts (e.g. two resets,
-				// or a reset and a set-password, completing concurrently).
-				await convergeOpaqueAccounts(ctx, user.id, accountId, newCredential);
-
+				// Announced before the binding check, removed once written: a
+				// concurrent set-password of the user sees it and yields.
+				let inFlight: string | undefined;
+				try {
+					// Consumed outside the transaction: the atomic consume is the
+					// gate between concurrent completes.
+					const { user, account } = await verifyResetCredential(
+						ctx,
+						deps,
+						credential,
+						true,
+						async (userId) => {
+							inFlight = resetInFlightIdentifier(userId);
+							await adapter.createVerificationValue({
+								identifier: inFlight,
+								value: userId,
+								expiresAt: new Date(Date.now() + RESET_IN_FLIGHT_TTL_MS),
+							});
+						},
+					);
+					await writeResetPassword(ctx, user, account, registrationRecord);
+				} finally {
+					if (inFlight) await adapter.deleteVerificationByIdentifier(inFlight);
+				}
 				return ctx.json({ status: true });
 			},
 		),
 	};
+}
+
+/**
+ * The write of a reset complete: replaces the user's record (a
+ * compare-and-swap on the one the credential's binding was checked against)
+ * or, if they had none, creates an account and converges with concurrent
+ * writers. Marks the email verified, deletes every session and every
+ * outstanding challenge / reset credential.
+ */
+async function writeResetPassword(
+	ctx: GenericEndpointContext,
+	user: User,
+	account: OpaqueAccount | undefined,
+	registrationRecord: string,
+): Promise<void> {
+	const adapter = ctx.context.internalAdapter;
+
+	// Re-registered under the current email (the challenge step's
+	// identifier; the credential's binding guarantees it is unchanged).
+	const newCredential = { registrationRecord, identifier: normalizeEmail(user.email) };
+
+	const accountId = await runWithTransaction(ctx.context.adapter, async () => {
+		let id: string;
+		if (account) {
+			// Compare-and-swap on the record the credential's binding was
+			// checked against: a password write that landed since (another
+			// reset, a change) wins, and this reset fails cleanly.
+			if (!(await swapOpaqueRecord(ctx, account.id, account.registrationRecord, newCredential))) {
+				throw invalidToken();
+			}
+			id = account.id;
+		} else {
+			// No password when the binding was checked: a new account,
+			// converged below with any concurrent writer's (a
+			// concurrent set-password yields to it).
+			id = (await createOpaqueAccount(ctx, user.id, newCredential)).id;
+		}
+		// Following the emailed link/code proved control of the mailbox.
+		if (!user.emailVerified) {
+			await adapter.updateUser(user.id, { emailVerified: true });
+		}
+		await adapter.deleteUserSessions(user.id);
+		await purgeOutstandingCredentials(ctx, user);
+		return id;
+	});
+	// After commit: never leave two OPAQUE accounts (e.g. two resets,
+	// or a reset and a set-password, completing concurrently).
+	if (!account) await convergeOpaqueAccounts(ctx, user.id, accountId, newCredential);
 }

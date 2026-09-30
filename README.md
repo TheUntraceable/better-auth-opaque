@@ -121,7 +121,7 @@ At initialisation the plugin logs a warning when:
 
 * `OPAQUE_SERVER_KEY` is missing (development only; production throws);
 * `insecureCreateSessionOnRegister` is on;
-* `sendResetPassword`, `sendResetPasswordOTP` or core's `emailVerification.sendVerificationEmail` is configured but `advanced.backgroundTasks.handler` is not (see [Limitations](#limitations));
+* an OPAQUE endpoint sends email inline because `advanced.backgroundTasks.handler` is not configured (see [Limitations](#limitations)). The warning names each affected endpoint: `/opaque/forget-password` (when `sendResetPassword` or `sendResetPasswordOTP` is set), `/sign-up/opaque/complete` (when core's `sendVerificationEmail` is set and `emailVerification.sendOnSignUp` is true, or unset while verification is required) and `/sign-in/opaque/complete` (when verification is required and `emailVerification.sendOnSignIn` is true). A `sendVerificationEmail` that no OPAQUE endpoint uses logs nothing;
 * there is no `database` or `secondaryStorage`, so sessions cannot be revoked. With `session.cookieCache.enabled` it logs an info message instead (see [The cookie cache caveat](#the-cookie-cache-caveat)).
 
 ### 2.3 Client plugin
@@ -142,9 +142,11 @@ export const authClient = createAuthClient({
 
 ### 2.4 Database schema
 
-The plugin adds one optional, **non-unique** string field to Better Auth's `account` table: `registrationRecord`. Run Better Auth's CLI (`npx @better-auth/cli generate` or `migrate`) after adding the plugin. Challenge nonces, reset tokens, reset codes and set-password challenges are stored in core's `verification` table.
+The plugin adds one optional, **non-unique** string field to Better Auth's `account` table: `registrationRecord`. It is server-only (`input: false`, `returned: false`): it is never accepted from API input and never part of API output, so for example core's `/list-accounts` lists the OPAQUE account without it. Run Better Auth's CLI (`npx @better-auth/cli generate` or `migrate`) after adding the plugin. Challenge nonces, reset tokens, reset codes, set-password challenges and short-lived "reset in progress" markers are stored in core's `verification` table.
 
 On an OPAQUE account row (`providerId: "opaque"`), `accountId` holds the **OPAQUE identifier** the record was registered under: the lower-cased email at registration or reset time. The handshake depends on this identifier, so storing it means a later email change (for example through core's `changeEmail`) doesn't break login. Rows written by older versions hold a generated id there instead; for them the plugin falls back to the user's current email, and the next password change or reset stores the identifier.
+
+> **`accountId` is not unique across users.** Because it keeps the email a password was registered under, two users can hold the same `accountId`: if Alice changes her email from `a@example.com` to `b@example.com`, her OPAQUE account keeps `accountId: "a@example.com"`, and a new user who then signs up as `a@example.com` gets an OPAQUE account with the same `accountId`. The plugin always looks OPAQUE accounts up by `userId`, never by `accountId`. **Do not add a unique index on `(providerId, accountId)`** (or on `accountId`) of the `account` table: it would make that sign-up (or a reset) fail.
 
 > **Existing deployments:** older versions declared `registrationRecord` as `unique`. It no longer is (a unique index on a long string column fails on MySQL and MSSQL, and records are random anyway). You may drop that unique index or constraint; keeping it is harmless.
 
@@ -373,7 +375,7 @@ Reset is enabled by configuring `sendResetPassword` (link), `sendResetPasswordOT
 
 Reset also works for users whose email is not verified, and a successful reset marks the email as verified, because using the emailed link or code proves control of the mailbox.
 
-The callbacks are awaited unless you configure Better Auth's `advanced.backgroundTasks.handler` (see [Limitations](#limitations)). An error thrown by a callback is logged, and the endpoint still responds normally.
+The callbacks are awaited unless you configure Better Auth's `advanced.backgroundTasks.handler` (see [Limitations](#limitations)). An error from a callback, whether it throws synchronously or returns a rejected promise, is logged once at error level, and the endpoint still responds normally, with the same body as for an unknown email. The same holds for core's `sendVerificationEmail` when an OPAQUE endpoint calls it.
 
 Every link and code is **bound to the user's id, current email and current password record** when it is issued. Any later email change or password write (reset, change, set) makes it invalid (`INVALID_TOKEN`), whichever storage the verification table uses. A successful reset, change or set password also deletes the user's outstanding links and code.
 
@@ -446,6 +448,7 @@ Code rules:
 * **Hashed at rest:** only an HMAC of the code, bound to the email and keyed with a key derived from Better Auth's `secret`, is stored, under an identifier that is itself a keyed hash of the email (the table holds no email). A code issued for one email can't reset another.
 * **Bound to the account:** an email change or any password write invalidates the code.
 * The code is consumed by a successful `resetPassword`. A malformed request (for example a bad `registrationRecord`) neither consumes it nor counts as an attempt.
+* The challenge step only **reads** a correct code (constant-time comparison, no write), so it never races the complete step. Only a wrong guess takes the code (atomically, which serialises concurrent guesses) and puts it back with one more attempt counted.
 
 ### Offering both
 
@@ -499,7 +502,7 @@ betterAuth({
 
 ## 6. API Endpoints Reference
 
-Paths are relative to Better Auth's base path (default `/api/auth`). All POST endpoints go through Better Auth's origin/CSRF checks, so browser requests must come from a trusted origin. Every step is driven by the client plugin's actions, so the endpoints are hidden from the inferred client and `auth.api` types.
+Paths are relative to Better Auth's base path (default `/api/auth`). All POST endpoints go through Better Auth's origin/CSRF checks, so browser requests must come from a trusted origin. Every step is driven by the client plugin's actions, so the endpoints are hidden from the inferred client and from the `auth.api` type (with or without `setPassword.enabled`): `typeof auth.api` has no `opaque*` keys. They still exist at runtime under their `opaque*` endpoint keys (`opaqueSignInChallenge`, `opaqueChangePasswordComplete`, ...), but calling one step on its own is rarely useful.
 
 | Flow            | Method | Path                                  | Auth required                               | Purpose |
 | :-------------- | :----- | :------------------------------------ | :------------------------------------------ | :------ |
@@ -525,7 +528,7 @@ Errors use Better Auth's `{ code, message }` body. The codes below are exported 
 | Code                                   | Status | When |
 | :------------------------------------- | :----- | :--- |
 | `INVALID_EMAIL_OR_PASSWORD` (*core*)   | 401    | Login: wrong password, unknown email, user without an OPAQUE password, a replayed or unknown challenge, or a stale challenge (the password was reset or changed after it was issued). Deliberately the same in every case. |
-| `INVALID_CURRENT_PASSWORD`             | 401    | Change password: the current password didn't verify, or the challenge was replayed, belongs to another user, or is stale (the password was reset or changed after it was issued). |
+| `INVALID_CURRENT_PASSWORD`             | 401    | Change password: the current password didn't verify, or the challenge was replayed, belongs to another user, or is stale (the password was reset or changed after it was issued, including by a reset that completes while the change is in flight: the change never overwrites it, and creates no session). |
 | `INVALID_REGISTRATION_REQUEST`         | 400    | A `registrationRequest` is not 32 bytes or can't be deserialised (sign-up, change, reset or set password challenge). |
 | `INVALID_REGISTRATION_RECORD`          | 400    | A `registrationRecord` is not 170 to 200 bytes or can't be deserialised (sign-up, change, reset or set password complete). |
 | `INVALID_LOGIN_REQUEST`                | 400    | A `loginRequest` is not 96 bytes or can't be deserialised (login or change password challenge). |
@@ -534,9 +537,9 @@ Errors use Better Auth's `{ code, message }` body. The codes below are exported 
 | `LOGIN_STATE_EXPIRED`                  | 400    | `encryptedServerState` is older than 15 minutes. |
 | `OPAQUE_ACCOUNT_NOT_FOUND`             | 400    | Change password for a user without an OPAQUE password (returned by the challenge step; the caller is authenticated, so there is nothing to hide). Use a password reset, or `setPassword` if enabled. |
 | `FAILED_TO_CREATE_SESSION` (*core*)    | 500    | The database adapter did not return a session after login or a password change. |
-| `INVALID_TOKEN` (*core*)               | 400    | Reset: unknown, expired, used or superseded (email changed, or password written since) link token or code; a wrong code; a code locked after `allowedAttempts` wrong guesses; a code for a different email; or not exactly one credential (`token` **or** `email` + `otp`). |
+| `INVALID_TOKEN` (*core*)               | 400    | Reset: unknown, expired, used or superseded (email changed, or password written since) link token or code; a wrong code; a code locked after `allowedAttempts` wrong guesses; a code for a different email; or not exactly one credential (`token` **or** `email` + `otp`). Also the reset that loses a race with another password write (for example a second reset) that replaced the record after this reset's credential was checked: it does not overwrite. |
 | `RESET_PASSWORD_METHOD_NOT_CONFIGURED` | 400    | Forgot password: the requested `method` (or, with no `method`, both methods) has no callback configured. Returned for any email. |
-| `OPAQUE_ACCOUNT_ALREADY_EXISTS`        | 400    | Set password: the user already has an OPAQUE password (use change password). Also what the loser of two concurrent `complete` calls may get. |
+| `OPAQUE_ACCOUNT_ALREADY_EXISTS`        | 400    | Set password: the user already has an OPAQUE password (use change password). Also what the loser of two concurrent `complete` calls may get, and what set password gets when a password reset of the same user runs concurrently: the reset has priority, and set password never answers `200` for a password that is not the one stored. |
 | `SET_PASSWORD_CHALLENGE_REQUIRED`      | 400    | Set password `complete` without a live challenge: none was requested, it expired (15 minutes), it was already used, or the user's email changed since. Also what the loser of two concurrent `complete` calls may get. |
 | `EMAIL_NOT_VERIFIED` (*core*)          | 403    | Login: the password is correct but the email is not verified and verification is required. |
 
@@ -556,7 +559,7 @@ Errors use Better Auth's `{ code, message }` body. The codes below are exported 
 
 ### Challenge state
 
-The login and change-password server state goes through the client in encrypted form (Better Auth's `symmetricEncrypt`, under the derived state key). It contains only the user id, padded to a fixed block size so its length doesn't depend on the user. Each state:
+The login and change-password server state goes through the client in encrypted form (Better Auth's `symmetricEncrypt`, under the derived state key). It contains the OPAQUE server login state, the user id (never the user object: no email, name or other profile data), the nonce, the purpose (`login` or `change-password`), the registration-record digest and the issue time, padded to a fixed block size so its length doesn't depend on the user. Each state:
 
 * is bound to a nonce row in the `verification` table, which is **consumed before** the proof is checked, so a replay or a failed attempt can't be retried with the same state;
 * **expires after 15 minutes**, both the nonce row and the timestamp inside the state;
@@ -571,11 +574,21 @@ The set-password challenge is a single verification row per user (15 minutes), h
 * Reset links and codes are bound to the **user id, the normalised email and the current registration record** (or the absence of one) at issue time. An email change or any password write (reset, change, set) makes every earlier link and code fail with `INVALID_TOKEN`, on every storage, including secondary-storage-only verification and hashed verification identifiers.
 * In addition, a successful reset, change or set password **purges** the user's outstanding login and change-password challenge nonces, reset links and the current email's reset code. This is cleanup; the binding above is the security boundary (rows in secondary storage can't be enumerated, so only the code row is deleted there).
 
+### Concurrent password writes
+
+* **Every replacement of an existing record is a compare-and-swap** on the record the request checked its credential against (change password: the record the current password was proven against; reset: the record the link or code is bound to). One conditional `UPDATE ... WHERE id = ? AND registrationRecord = ?`, inside the request's transaction. If another write landed in between, nothing is written: a change password gets `401 INVALID_CURRENT_PASSWORD` (its transaction rolls back, so no session is rotated or created), a reset gets `400 INVALID_TOKEN`. The first write wins; nothing is silently overwritten.
+* **Users without an OPAQUE password** (the database can't enforce one OPAQUE account per user): concurrent resets each create an account and then converge on exactly one. A **reset has priority over set password**: a reset writes a short-lived "reset in progress" marker (a `verification` row, removed when the reset finishes, 60-second expiry otherwise) before it checks its credential, and set password, after writing its account, yields to a marker or to any other OPAQUE account (removing its own, or handing it over) and answers `400 OPAQUE_ACCOUNT_ALREADY_EXISTS`. Before answering `200` it re-reads the stored record and checks it is its own. If set password committed before the reset checked its credential, the reset is stale and fails with `INVALID_TOKEN` instead.
+* These writes use the adapter directly (they must be conditional), so they don't run `databaseHooks.account.update` hooks.
+
+### Verification table housekeeping
+
+Challenges that are started but never completed leave an expired row in the `verification` table. The plugin deletes **every expired verification row** (like core's own cleanup, and not at all with `verification.disableCleanup`) on the change-password challenge, the set-password challenge and `/opaque/forget-password` (for known and unknown emails alike): authenticated or rate-limited, rarely used paths. The unauthenticated sign-in challenge never does, so its cost and database footprint don't depend on the table. With secondary-storage-only verification, rows expire by TTL and nothing is deleted.
+
 ### Sessions
 
 * **Password change rotates the session.** The calling session is always deleted and replaced with a new token and new cookies, keeping its "remember me" setting. With `revokeOtherSessions` (the default) every other session of the user is deleted too.
 * **Password reset revokes all sessions** of the user and doesn't create a new one.
-* **Set password** is off by default (see [`opaque.setPassword`](#opaquesetpassword-opt-in) for why). When enabled it requires a *fresh* session (created within `session.freshAge`, default 24 hours) that is read from the database. Don't set `session.freshAge: 0`, because that disables the freshness check. Only one set-password `complete` can succeed per challenge, and concurrent password writers (two completes, or a set password racing a reset) converge on exactly one OPAQUE account.
+* **Set password** is off by default (see [`opaque.setPassword`](#opaquesetpassword-opt-in) for why). When enabled it requires a *fresh* session (created within `session.freshAge`, default 24 hours) that is read from the database. Don't set `session.freshAge: 0`, because that disables the freshness check. Only one set-password `complete` can succeed per challenge, and concurrent password writers (two completes, or a set password racing a reset) end with exactly one OPAQUE account; the reset wins a race with set password (see [Concurrent password writes](#concurrent-password-writes)).
 * Change password and set password read the session from the database, so a revoked session is rejected there even while its cookie cache is still valid.
 
 ### The cookie cache caveat
@@ -606,7 +619,7 @@ Every OPAQUE message is checked for canonical base64url format and byte length b
 ### Limitations
 
 * **No per-email throttling.** Rate limits are per client IP and path. The plugin doesn't limit how many reset emails one address can receive, or how many codes can be requested for it, across IPs. Each new code starts a fresh `allowedAttempts` budget. If that matters to you, throttle per email in your `sendResetPassword` / `sendResetPasswordOTP` callback or in front of `/opaque/forget-password`.
-* **Email callbacks are awaited unless background tasks are configured.** `sendResetPassword`, `sendResetPasswordOTP` and core's `sendVerificationEmail` run only for existing users (or, on sign-up, only for new ones). Sent inline, their latency tells an observer whether an email is registered, through the response time of `/opaque/forget-password` and `/sign-up/opaque/complete`. Configure Better Auth's `advanced.backgroundTasks.handler` so they run after the response is sent, for example `{ handler: waitUntil }` with `waitUntil` from `@vercel/functions`, or `(p) => executionCtx.waitUntil(p)` on Cloudflare Workers. The plugin logs a warning at startup when an email callback is configured without it. Background tasks don't remove the rest of the difference: a new sign-up still writes to the database.
+* **Email callbacks are awaited unless background tasks are configured.** `sendResetPassword`, `sendResetPasswordOTP` and core's `sendVerificationEmail` run only for existing users (or, on sign-up, only for new ones). Sent inline, their latency tells an observer whether an email is registered, through the response time of `/opaque/forget-password` and `/sign-up/opaque/complete` (and, for a caller who knows the password, whether it is verified, through `/sign-in/opaque/complete` with `sendOnSignIn`). Configure Better Auth's `advanced.backgroundTasks.handler` so they run after the response is sent, for example `{ handler: waitUntil }` with `waitUntil` from `@vercel/functions`, or `(p) => executionCtx.waitUntil(p)` on Cloudflare Workers. The plugin logs a warning at startup, naming the affected endpoints, when an OPAQUE endpoint would send email without it. Background tasks don't remove the rest of the difference: a new sign-up still writes to the database.
 
 ## 9. Migrating to 3.0 (Breaking Changes)
 
@@ -635,7 +648,20 @@ Every OPAQUE message is checked for canonical base64url format and byte length b
 
 8. **Set password is opt-in.** It is off by default; enable it with `setPassword: { enabled: true }` only if you need it, and read [why](#opaquesetpassword-opt-in) first. The password reset flow also creates an OPAQUE password for users who don't have one.
 
-9. **The account schema changed.** `registrationRecord` is no longer `unique`; you may drop the old unique index. New and updated OPAQUE accounts store the OPAQUE identifier (the lower-cased email) in `accountId`. Accounts written by 2.x hold a generated id there and keep working: the plugin falls back to the user's current email for them, and stores the identifier at their next password change or reset. See [Database schema](#24-database-schema).
+9. **The account schema changed.** `registrationRecord` is no longer `unique`; you may drop the old unique index. New and updated OPAQUE accounts store the OPAQUE identifier (the lower-cased email) in `accountId`. Accounts written by 2.x hold a generated id there and keep working: the plugin falls back to the user's current email for them, and stores the identifier at their next password change or reset. See [Database schema](#24-database-schema). `registrationRecord` is also no longer returned by API output (for example core's `/list-accounts`) or accepted as API input. If you added a unique index on `(providerId, accountId)`, drop it (see the note in [Database schema](#24-database-schema)).
+
+10. **Server endpoint keys were renamed, and are hidden from the `auth.api` type.** Only relevant if you called the steps on the server through `auth.api` (they are internal steps of the client actions):
+
+    | 2.x key                      | 3.0 key                          |
+    | :--------------------------- | :------------------------------- |
+    | `getRegisterChallenge`       | `opaqueSignUpChallenge`          |
+    | `completeRegistration`       | `opaqueSignUpComplete`           |
+    | `getLoginChallenge`          | `opaqueSignInChallenge`          |
+    | `completeLogin`              | `opaqueSignInComplete`           |
+    | `getChangePasswordChallenge` | `opaqueChangePasswordChallenge`  |
+    | `completeChangePassword`     | `opaqueChangePasswordComplete`   |
+
+    The new endpoints (`opaqueForgetPassword`, `opaqueResetPasswordCallback`, `opaqueResetPasswordChallenge`, `opaqueResetPasswordComplete`, `opaqueSetPasswordChallenge`, `opaqueSetPasswordComplete`) follow the same scheme. None of them is part of `typeof auth.api` any more; they still exist at runtime under these keys.
 
 Also new in 3.0, and worth checking before you deploy:
 

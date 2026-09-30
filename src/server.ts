@@ -60,15 +60,30 @@ export const opaque = (options?: OpaqueOptions) => {
 					"⚠️ [better-auth-opaque] insecureCreateSessionOnRegister is enabled. This will automatically create a session upon registration, which could lead to user enumeration. Use with caution in production environments.",
 				);
 			}
-			// Emails go out only for existing users: sent inline, their latency
-			// tells an observer whether an email is registered.
-			const sendsEmail =
-				!!resolved.raw.sendResetPassword ||
-				!!resolved.raw.sendResetPasswordOTP ||
-				!!ctx.options.emailVerification?.sendVerificationEmail;
-			if (sendsEmail && !ctx.options.advanced?.backgroundTasks?.handler) {
+			// Emails go out only for existing (or unverified) users: sent inline,
+			// their latency tells an observer whether an email is registered.
+			// Only the endpoints that really send an email with this
+			// configuration are named.
+			const requireVerification =
+				resolved.raw.requireEmailVerification ??
+				ctx.options.emailAndPassword?.requireEmailVerification ??
+				false;
+			const verification = ctx.options.emailVerification;
+			const inlineEmailEndpoints = [
+				...(resolved.raw.sendResetPassword || resolved.raw.sendResetPasswordOTP
+					? ["/opaque/forget-password"]
+					: []),
+				...(verification?.sendVerificationEmail &&
+				(verification.sendOnSignUp ?? requireVerification)
+					? ["/sign-up/opaque/complete"]
+					: []),
+				...(verification?.sendVerificationEmail && requireVerification && verification.sendOnSignIn
+					? ["/sign-in/opaque/complete"]
+					: []),
+			];
+			if (inlineEmailEndpoints.length > 0 && !ctx.options.advanced?.backgroundTasks?.handler) {
 				ctx.logger.warn(
-					"⚠️ [better-auth-opaque] Emails (password reset / verification) are sent inline because `advanced.backgroundTasks.handler` is not configured. They are only sent for existing users, so the response timing of /opaque/forget-password and /sign-up/opaque/complete reveals whether an email is registered. Configure `advanced.backgroundTasks` (e.g. `{ handler: waitUntil }`).",
+					`⚠️ [better-auth-opaque] Emails (password reset / verification) are sent inline because \`advanced.backgroundTasks.handler\` is not configured. They are only sent for existing (or unverified) users, so the response timing of ${inlineEmailEndpoints.join(", ")} reveals whether an email is registered. Configure \`advanced.backgroundTasks\` (e.g. \`{ handler: waitUntil }\`).`,
 				);
 			}
 			// A password change revokes other sessions server-side, but Better
@@ -111,9 +126,14 @@ export const opaque = (options?: OpaqueOptions) => {
 				fields: {
 					// Not `unique`: a unique index on a long string column fails on
 					// MySQL / MSSQL, and records are random anyway.
+					// Server-only: never accepted from, or returned in, API
+					// input/output (e.g. core's /list-accounts). The plugin reads
+					// and writes it through the adapter.
 					registrationRecord: {
 						type: "string",
 						required: false,
+						returned: false,
+						input: false,
 						validator: { input: z.string().base64url() },
 					},
 				},
@@ -124,8 +144,12 @@ export const opaque = (options?: OpaqueOptions) => {
 			...signInEndpoints(deps),
 			...changePasswordEndpoints(deps),
 			...resetPasswordEndpoints(deps),
-			// Opt-in: when disabled the routes do not exist (404).
-			...(resolved.setPasswordEnabled ? setPasswordEndpoints(deps) : {}),
+			// Opt-in: when disabled the routes do not exist (404). Typed as
+			// always present: optional keys (`{} | endpoints`) would defeat
+			// Better Auth's `auth.api` filtering of hidden endpoints.
+			...(resolved.setPasswordEnabled
+				? setPasswordEndpoints(deps)
+				: ({} as ReturnType<typeof setPasswordEndpoints>)),
 		},
 	} satisfies BetterAuthPlugin;
 };

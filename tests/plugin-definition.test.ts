@@ -7,7 +7,17 @@ import { describe, expect, test } from "bun:test";
 import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { opaque } from "../src/server";
-import { BASE_PATH, createTestHarness, type LogEntry, ORIGIN, randomBase64Url, uniqueEmail } from "./helpers/harness";
+import {
+	BASE_PATH,
+	createTestHarness,
+	type Equal,
+	type Expect,
+	type Extends,
+	type LogEntry,
+	ORIGIN,
+	randomBase64Url,
+	uniqueEmail,
+} from "./helpers/harness";
 
 await ready;
 
@@ -47,6 +57,38 @@ describe("endpoints", () => {
 	});
 });
 
+describe("auth.api types", () => {
+	// Type-level only (checked by `tsc -p tests`): the OPAQUE endpoints are
+	// hidden from `auth.api` (metadata `isAction: false`), with and without
+	// the opt-in set-password endpoints.
+	const withoutSetPassword = betterAuth({ plugins: [opaque({ OPAQUE_SERVER_KEY })] });
+	const withSetPassword = betterAuth({ plugins: [opaque({ OPAQUE_SERVER_KEY, setPassword: { enabled: true } })] });
+	type HiddenKey =
+		| "opaqueSignInChallenge"
+		| "opaqueSignInComplete"
+		| "opaqueSignUpChallenge"
+		| "opaqueSignUpComplete"
+		| "opaqueChangePasswordChallenge"
+		| "opaqueChangePasswordComplete"
+		| "opaqueForgetPassword"
+		| "opaqueResetPasswordChallenge"
+		| "opaqueResetPasswordComplete"
+		| "opaqueResetPasswordCallback"
+		| "opaqueSetPasswordChallenge"
+		| "opaqueSetPasswordComplete";
+
+	test("no OPAQUE endpoint key is part of typeof auth.api; core endpoints still are", () => {
+		// @ts-expect-error hidden from auth.api
+		type _SignIn = typeof withoutSetPassword.api.opaqueSignInChallenge;
+		// @ts-expect-error hidden from auth.api
+		type _SignInWithSet = typeof withSetPassword.api.opaqueSignInChallenge;
+		type _None = Expect<Equal<Extract<keyof typeof withoutSetPassword.api, HiddenKey>, never>>;
+		type _NoneWithSet = Expect<Equal<Extract<keyof typeof withSetPassword.api, HiddenKey>, never>>;
+		type _Core = Expect<Extends<"getSession" | "signOut", keyof typeof withSetPassword.api>>;
+		expect(typeof withSetPassword.api.getSession).toBe("function");
+	});
+});
+
 describe("schema", () => {
 	test("account.registrationRecord is an optional string WITHOUT a unique constraint (a unique long string breaks MySQL/MSSQL)", () => {
 		const field = opaque({ OPAQUE_SERVER_KEY }).schema.account.fields.registrationRecord as {
@@ -57,6 +99,37 @@ describe("schema", () => {
 		expect(field.type).toBe("string");
 		expect(field.required).toBe(false);
 		expect(field.unique).toBeFalsy();
+	});
+});
+
+describe("registrationRecord is never part of API output", () => {
+	test("GET /list-accounts returns the opaque account WITHOUT registrationRecord; login, change-password and re-login work", async () => {
+		const h = await createTestHarness();
+		const email = uniqueEmail("hidden-record");
+		await h.register(email, "first password");
+		const device = await h.loggedInDevice(email, "first password");
+		expect(await h.db.registrationRecord(email)).toBeString();
+
+		const list = await device.request("/list-accounts", { method: "GET" });
+		expect(list.status).toBe(200);
+		const accounts = list.body as Array<Record<string, unknown>>;
+		const opaqueAccount = accounts.find((a) => a.providerId === "opaque");
+		expect(opaqueAccount).toBeDefined();
+		expect(Object.keys(opaqueAccount!)).not.toContain("registrationRecord");
+		expect(list.text).not.toContain((await h.db.registrationRecord(email))!);
+
+		const change = await device.client.opaque.changePassword({ currentPassword: "first password", newPassword: "second password" });
+		expect(change.error).toBeNull();
+		expect((await h.device().client.signIn.opaque({ email, password: "second password" })).error).toBeNull();
+		expect((await h.device().client.signIn.opaque({ email, password: "first password" })).error).not.toBeNull();
+	});
+
+	test("the schema field is returned: false, input: false", () => {
+		const field = opaque({ OPAQUE_SERVER_KEY }).schema.account.fields.registrationRecord as {
+			returned?: unknown;
+			input?: unknown;
+		};
+		expect({ returned: field.returned, input: field.input }).toEqual({ returned: false, input: false });
 	});
 });
 

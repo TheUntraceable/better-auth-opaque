@@ -10,7 +10,9 @@ import { opaque } from "../src/server";
 import {
 	createTestHarness,
 	type LogEntry,
+	pauseWriteAfterAccountRead,
 	randomBase64Url,
+	rawRegister,
 	rawResetPassword,
 	SESSION_TOKEN_COOKIE,
 	sleep,
@@ -504,12 +506,46 @@ describe("S9: attacker-controlled input never produces an error-level log", () =
 
 /* ------------------------------------------------------------------------- */
 
-describe("S10: init warns when reset emails are sent inline (no advanced.backgroundTasks)", () => {
+describe("S10 / F5: init warns when emails are sent inline (no advanced.backgroundTasks), naming the endpoints that send them", () => {
 	const isBackgroundWarning = (l: LogEntry) => l.level === "warn" && /background/i.test(l.message) && /timing/i.test(l.message);
 
 	test("sendResetPassword configured, no backgroundTasks → exactly one warn mentioning timing and background tasks", async () => {
 		const hWarn = await createTestHarness({ resetLink: true });
 		expect(hWarn.logs.filter(isBackgroundWarning)).toHaveLength(1);
+	});
+
+	const warnings = (hh: TestHarness) => hh.logs.filter(isBackgroundWarning).map((l) => l.message);
+
+	test("core sendVerificationEmail configured but never sent by an OPAQUE endpoint (sendOnSignUp: false, no requireEmailVerification) → no warning", async () => {
+		const hh = await createTestHarness({ verification: { sendOnSignUp: false } });
+		expect(warnings(hh)).toEqual([]);
+	});
+
+	test("sendOnSignUp: true → one warning naming /sign-up/opaque/complete (and not the endpoints that send nothing)", async () => {
+		const hh = await createTestHarness({ verification: { sendOnSignUp: true } });
+		expect(warnings(hh)).toHaveLength(1);
+		expect(warnings(hh)[0]).toContain("/sign-up/opaque/complete");
+		expect(warnings(hh)[0]).not.toContain("/opaque/forget-password");
+		expect(warnings(hh)[0]).not.toContain("/sign-in/opaque/complete");
+	});
+
+	test("sendResetPassword → one warning naming /opaque/forget-password", async () => {
+		const hh = await createTestHarness({ resetLink: true });
+		expect(warnings(hh)).toHaveLength(1);
+		expect(warnings(hh)[0]).toContain("/opaque/forget-password");
+		expect(warnings(hh)[0]).not.toContain("/sign-up/opaque/complete");
+	});
+
+	test("reset emails + verification on sign-up and on sign-in → one warning naming all three endpoints", async () => {
+		const hh = await createTestHarness({
+			resetOTP: true,
+			verification: { sendOnSignUp: true, sendOnSignIn: true },
+			plugin: { requireEmailVerification: true },
+		});
+		expect(warnings(hh)).toHaveLength(1);
+		for (const path of ["/opaque/forget-password", "/sign-up/opaque/complete", "/sign-in/opaque/complete"]) {
+			expect(warnings(hh)[0]).toContain(path);
+		}
 	});
 
 	test("with advanced.backgroundTasks.handler configured → no such warning", async () => {
@@ -557,25 +593,72 @@ describe("C1: concurrent password writers converge on exactly one OPAQUE account
 		]);
 	});
 
-	test("set-password and a reset of the same user, completed concurrently", async () => {
-		const email = uniqueEmail("c1-set-reset");
-		const device = await hRace.coreSignUp(email);
-		const set = await startSetPassword(device, "race set password");
-		expect(set.res.status).toBe(200);
-		const token = await requestLink(hRace, email);
-		const reset = await startResetPassword(hRace.device(), { token }, "race reset password");
-		expect(reset.res.status).toBe(200);
+	test("set-password and a reset of the same user, completed concurrently: the reset wins (200, its password), set-password is 400 OPAQUE_ACCOUNT_ALREADY_EXISTS", async () => {
+		for (let round = 0; round < 5; round++) {
+			const email = uniqueEmail("c1-set-reset");
+			const device = await hRace.coreSignUp(email);
+			const set = await startSetPassword(device, "race set password");
+			expect(set.res.status).toBe(200);
+			const token = await requestLink(hRace, email);
+			const reset = await startResetPassword(hRace.device(), { token }, "race reset password");
+			expect(reset.res.status).toBe(200);
 
-		const [a, b] = await Promise.all([
-			device.post("/opaque/set-password/complete", { registrationRecord: set.registrationRecord }),
-			hRace.device().post("/opaque/reset-password/complete", { token, registrationRecord: reset.registrationRecord }),
-		]);
+			const completeSet = () => device.post("/opaque/set-password/complete", { registrationRecord: set.registrationRecord });
+			const completeReset = () =>
+				hRace.device().post("/opaque/reset-password/complete", { token, registrationRecord: reset.registrationRecord });
+			// Alternate which request is dispatched first.
+			const [setRes, resetRes] =
+				round % 2 === 0
+					? await Promise.all([completeSet(), completeReset()])
+					: await Promise.all([completeReset(), completeSet()]).then(([r, s]) => [s, r] as const);
 
-		expect([a.status, b.status]).toContain(200);
-		await expectConverged(email, [
-			{ record: set.registrationRecord!, password: "race set password" },
-			{ record: reset.registrationRecord!, password: "race reset password" },
-		]);
+			expect({ round, reset: resetRes.status }).toEqual({ round, reset: 200 });
+			expect({ round, set: setRes.status, code: setRes.body?.code }).toEqual({
+				round,
+				set: 400,
+				code: "OPAQUE_ACCOUNT_ALREADY_EXISTS",
+			});
+			await expectConverged(email, [{ record: reset.registrationRecord!, password: "race reset password" }]);
+			expect(await canLogIn(hRace, email, "race set password")).toBe(false);
+		}
+	});
+
+	test("without database latency too, set-password vs reset: a request is 200 exactly when its record is the one stored, set-password never reports 200 for a record a reset replaced", async () => {
+		const hFast = await createTestHarness({ resetOTP: true, emailAndPassword: true, plugin: { setPassword: { enabled: true } } });
+		for (let round = 0; round < 10; round++) {
+			const email = uniqueEmail("c1-fast");
+			const device = await hFast.coreSignUp(email);
+			const otp = await requestOTP(hFast, email);
+			const reset = await startResetPassword(hFast.device(), { email, otp }, "fast reset password");
+			const set = await startSetPassword(device, "fast set password");
+			const completeSet = () => device.post("/opaque/set-password/complete", { registrationRecord: set.registrationRecord });
+			const completeReset = () =>
+				hFast.device().post("/opaque/reset-password/complete", { email, otp, registrationRecord: reset.registrationRecord });
+			const [setRes, resetRes] =
+				round % 2 === 0
+					? await Promise.all([completeSet(), completeReset()])
+					: await Promise.all([completeReset(), completeSet()]).then(([r, s]) => [s, r] as const);
+
+			const accounts = await hFast.db.opaqueAccounts(email);
+			expect(accounts.length).toBeLessThanOrEqual(1);
+			const stored = (accounts[0] as { registrationRecord?: string } | undefined)?.registrationRecord;
+			const outcome = {
+				round,
+				set: setRes.status === 200 ? 200 : setRes.body?.code,
+				reset: resetRes.status === 200 ? 200 : resetRes.body?.code,
+				setStored: stored === set.registrationRecord,
+				resetStored: stored === reset.registrationRecord,
+			};
+			expect(outcome).toEqual({
+				round,
+				set: outcome.setStored ? 200 : "OPAQUE_ACCOUNT_ALREADY_EXISTS",
+				reset: outcome.resetStored ? 200 : "INVALID_TOKEN",
+				setStored: outcome.setStored,
+				resetStored: outcome.resetStored,
+			});
+			expect(await canLogIn(hFast, email, "fast set password")).toBe(outcome.setStored);
+			expect(await canLogIn(hFast, email, "fast reset password")).toBe(outcome.resetStored);
+		}
 	});
 });
 
@@ -649,5 +732,127 @@ describe("C5: with secondaryStorage, an expired reset link is rejected", () => {
 		expectCode(complete, 400, "INVALID_TOKEN");
 		setSystemTime();
 		expect(await hStore.db.registrationRecord(email)).toBe(recordBefore);
+	});
+});
+
+/* ------------------------------------------------------------------------- */
+
+describe("F1: a password write is a compare-and-swap on the record it was checked against", () => {
+	test("reset vs reset: the reset that checked its binding before the other one wrote is 400 INVALID_TOKEN and does not overwrite", async () => {
+		const pause = pauseWriteAfterAccountRead();
+		const hp = await createTestHarness({ resetLink: true, resetOTP: true, onAdapterCall: pause.onAdapterCall });
+		const { email } = await registered(hp, "f1-resets");
+		const token = await requestLink(hp, email);
+		const otp = await requestOTP(hp, email);
+		const viaLink = await startResetPassword(hp.device(), { token }, "link password");
+		const viaOtp = await startResetPassword(hp.device(), { email, otp }, "otp password");
+		expect([viaLink.res.status, viaOtp.res.status]).toEqual([200, 200]);
+
+		pause.arm();
+		const linkRes = hp.device().post("/opaque/reset-password/complete", { token, registrationRecord: viaLink.registrationRecord });
+		await pause.paused; // the link reset checked its binding and is about to write
+		const otpRes = await hp.device().post("/opaque/reset-password/complete", { email, otp, registrationRecord: viaOtp.registrationRecord });
+		expect(otpRes.status).toBe(200);
+		pause.release();
+
+		expectCode(await linkRes, 400, "INVALID_TOKEN");
+		expect(await hp.db.opaqueAccounts(email)).toHaveLength(1);
+		expect(await hp.db.registrationRecord(email)).toBe(viaOtp.registrationRecord!);
+		expect(await canLogIn(hp, email, "otp password")).toBe(true);
+		expect(await canLogIn(hp, email, "link password")).toBe(false);
+	});
+});
+
+/* ------------------------------------------------------------------------- */
+
+describe("F4: an email callback that throws synchronously never turns into a 500 (no enumeration)", () => {
+	const boom = () => {
+		throw new Error("mailer down (sync)");
+	};
+	const errorLogs = (hh: TestHarness) => hh.logs.filter((l) => l.level === "error");
+
+	test.each([
+		["sendResetPasswordOTP", "otp"],
+		["sendResetPassword", "link"],
+	] as const)("%s throws synchronously: known and unknown emails are both 200 with identical bodies; one error log", async (option, method) => {
+		const hh = await createTestHarness({ plugin: { [option]: boom } });
+		const { email } = await registered(hh, `f4-${method}`);
+		const errorsBefore = errorLogs(hh).length;
+
+		const known = await hh.device().post("/opaque/forget-password", { email, method });
+		const unknown = await hh.device().post("/opaque/forget-password", { email: uniqueEmail("f4-ghost"), method });
+
+		expect({ status: known.status, body: known.body }).toEqual({ status: 200, body: unknown.body });
+		expect(unknown.status).toBe(200);
+		expect(errorLogs(hh).length - errorsBefore).toBe(1);
+	});
+
+	test("core sendVerificationEmail throws synchronously on sign-up: new and existing emails are both 201 with identical bodies; one error log", async () => {
+		const hh = await createTestHarness({
+			authOptions: { emailVerification: { sendOnSignUp: true, sendVerificationEmail: boom } },
+		});
+		const existing = uniqueEmail("f4-existing");
+		await rawRegister(hh.device(), existing, OLD_PASSWORD);
+		const errorsBefore = errorLogs(hh).length;
+
+		const fresh = await rawRegister(hh.device(), uniqueEmail("f4-new"), OLD_PASSWORD);
+		const again = await rawRegister(hh.device(), existing, OLD_PASSWORD);
+
+		expect({ status: fresh.complete.status, body: fresh.complete.body }).toEqual({ status: 201, body: again.complete.body });
+		expect(again.complete.status).toBe(201);
+		expect(errorLogs(hh).length - errorsBefore).toBe(1);
+	});
+});
+
+/* ------------------------------------------------------------------------- */
+
+const hGc = await createTestHarness({
+	resetOTP: true,
+	emailAndPassword: true,
+	plugin: { setPassword: { enabled: true } },
+});
+
+describe("F8: expired verification rows are cleaned up on authenticated / rarer paths, never on the sign-in challenge", () => {
+	const expiredLoginNonces = () =>
+		hGc.db
+			.verificationRows()
+			.filter((r) => r.identifier.startsWith("opaque-login:") && new Date(r.expiresAt).getTime() < Date.now());
+
+	/** Leaves 5 expired sign-in nonce rows behind (clock moved past their lifetime). */
+	async function expireFiveLoginNonces() {
+		for (let i = 0; i < 5; i++) await startLogin(hGc.device(), uniqueEmail("f8-nonce"), "irrelevant");
+		setSystemTime(new Date(Date.now() + 60 * 60 * 1000));
+		expect(expiredLoginNonces().length).toBeGreaterThanOrEqual(5);
+	}
+
+	test("the sign-in challenge (unauthenticated, hot) leaves them in place", async () => {
+		await expireFiveLoginNonces();
+		const before = expiredLoginNonces().length;
+		await startLogin(hGc.device(), uniqueEmail("f8-ghost"), "irrelevant");
+		expect(expiredLoginNonces().length).toBe(before);
+	});
+
+	test("a change-password challenge deletes them", async () => {
+		const { email } = await registered(hGc, "f8-change");
+		const device = await hGc.loggedInDevice(email, OLD_PASSWORD);
+		await expireFiveLoginNonces();
+		await startChangePassword(device, OLD_PASSWORD, NEW_PASSWORD);
+		expect(expiredLoginNonces()).toEqual([]);
+	});
+
+	test("forget-password deletes them (known and unknown email alike)", async () => {
+		const { email } = await registered(hGc, "f8-forget");
+		for (const target of [email, uniqueEmail("f8-forget-ghost")]) {
+			await expireFiveLoginNonces();
+			expect((await hGc.device().post("/opaque/forget-password", { email: target, method: "otp" })).status).toBe(200);
+			expect({ target, left: expiredLoginNonces() }).toEqual({ target, left: [] });
+		}
+	});
+
+	test("a set-password challenge deletes them", async () => {
+		const device = await hGc.coreSignUp(uniqueEmail("f8-set"));
+		await expireFiveLoginNonces();
+		expect((await startSetPassword(device, NEW_PASSWORD)).res.status).toBe(200);
+		expect(expiredLoginNonces()).toEqual([]);
 	});
 });

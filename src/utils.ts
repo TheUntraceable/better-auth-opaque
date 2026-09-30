@@ -164,6 +164,19 @@ export function setPasswordIdentifier(userId: string) {
 	return `${SET_PASSWORD_IDENTIFIER_PREFIX}${userId}`;
 }
 
+/**
+ * Marks a password reset of a user as in progress (from before its credential
+ * binding is checked until it has written), so that a concurrent
+ * set-password yields to it.
+ */
+export const RESET_IN_FLIGHT_IDENTIFIER_PREFIX = "opaque-reset-in-flight:";
+/** How long an in-flight marker counts if its reset never removes it (e.g. a crash). */
+export const RESET_IN_FLIGHT_TTL_MS = 60 * 1000;
+
+export function resetInFlightIdentifier(userId: string) {
+	return `${RESET_IN_FLIGHT_IDENTIFIER_PREFIX}${userId}`;
+}
+
 /* ------------------------------------------------------------------------- */
 /*                               Keyed hashing                               */
 /* ------------------------------------------------------------------------- */
@@ -322,9 +335,13 @@ export function cloneRequest(request: Request | undefined): Request | undefined 
 }
 
 /**
- * The single normalisation used for the OPAQUE `userIdentifier` everywhere
- * (register, login, change password). Matches Better Auth core, which
- * lower-cases emails in `createUser` and `findUserByEmail`.
+ * The plugin's single email normalisation (lower-casing, as Better Auth core
+ * does in `createUser` and `findUserByEmail`). Applied to every email the
+ * plugin receives or compares (lookups, reset codes and their bindings) and
+ * to the OPAQUE `userIdentifier` when a record is registered (sign-up, reset,
+ * set-password). Login and change-password do not re-derive the identifier
+ * from the user's current email: they use the one stored with the record as
+ * the account's `accountId` (see `opaqueIdentifier` in `server/shared.ts`).
  */
 export function normalizeEmail(email: string): string {
 	return email.toLowerCase();

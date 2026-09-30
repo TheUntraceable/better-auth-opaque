@@ -594,6 +594,37 @@ export type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends <T>() => T exte
 export type IsAny<T> = 0 extends 1 & T ? true : false;
 export type Extends<A, B> = [A] extends [B] ? true : false;
 
+/**
+ * For `HarnessOptions.onAdapterCall`: deterministic interleaving. Once
+ * armed, the first database transaction that starts after an `account` read
+ * (the password write that follows a record check, before its snapshot is
+ * taken) waits until `release()`.
+ */
+export function pauseWriteAfterAccountRead() {
+	let armed = false;
+	let sawAccountRead = false;
+	let release!: () => void;
+	let reached!: () => void;
+	const gate = new Promise<void>((r) => (release = r));
+	const paused = new Promise<void>((r) => (reached = r));
+	return {
+		arm() {
+			armed = true;
+		},
+		paused,
+		release: () => release(),
+		onAdapterCall: async ({ method, model }: InterceptedAdapterCall) => {
+			if (!armed) return;
+			if (method === "findMany" && model === "account") sawAccountRead = true;
+			else if (method === "transaction" && sawAccountRead) {
+				armed = false;
+				reached();
+				await gate;
+			}
+		},
+	};
+}
+
 export function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -650,14 +681,37 @@ const ADAPTER_METHODS = new Set([
 	"incrementOne",
 ]);
 
-/** Records every public adapter method call ({ method, model }) into `calls`. */
-function spyOnAdapter<A extends object>(adapter: A, calls: AdapterCall[]): A {
+/** What `HarnessOptions.onAdapterCall` receives. */
+export interface InterceptedAdapterCall {
+	/** A public adapter method, or "transaction" (the start of a transaction, before its snapshot). */
+	method: string;
+	model: string | undefined;
+	args: any[];
+}
+
+/**
+ * Records every public adapter method call ({ method, model }) into `calls`,
+ * and lets `onCall` run (and, by returning a promise, delay) each call and
+ * each `transaction` start. Calls made through a transaction's own adapter
+ * are not seen.
+ */
+function spyOnAdapter<A extends object>(
+	adapter: A,
+	calls: AdapterCall[],
+	onCall?: (call: InterceptedAdapterCall) => void | Promise<void>,
+): A {
 	return new Proxy(adapter, {
 		get(target, key, receiver) {
 			const value = Reflect.get(target, key, receiver);
-			if (typeof key !== "string" || typeof value !== "function" || !ADAPTER_METHODS.has(key)) return value;
+			if (typeof key !== "string" || typeof value !== "function") return value;
+			const logged = ADAPTER_METHODS.has(key);
+			if (!logged && !(key === "transaction" && onCall)) return value;
 			return (...args: any[]) => {
-				calls.push({ method: key, model: args[0]?.model });
+				if (logged) calls.push({ method: key, model: args[0]?.model });
+				const pending = onCall?.({ method: key, model: logged ? args[0]?.model : undefined, args });
+				if (pending && typeof pending.then === "function") {
+					return pending.then(() => value.apply(target, args));
+				}
 				return value.apply(target, args);
 			};
 		},
@@ -692,6 +746,12 @@ export interface HarnessOptions {
 	 * are appended after the OPAQUE plugin; everything else replaces.
 	 */
 	authOptions?: Partial<BetterAuthOptions>;
+	/**
+	 * Called before every public adapter call and every `transaction` start
+	 * on the database adapter Better Auth uses; a returned promise delays the
+	 * call (e.g. to interleave two requests deterministically).
+	 */
+	onAdapterCall?: (call: InterceptedAdapterCall) => void | Promise<void>;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -754,7 +814,7 @@ export async function createTestHarness(options: HarnessOptions = {}) {
 	const extra = options.authOptions ?? {};
 	const auth = betterAuth({
 		database: ((dbOptions: BetterAuthOptions) =>
-			spyOnAdapter(baseAdapter(dbOptions), adapterCalls)) as unknown as BetterAuthOptions["database"],
+			spyOnAdapter(baseAdapter(dbOptions), adapterCalls, options.onAdapterCall)) as unknown as BetterAuthOptions["database"],
 		baseURL: ORIGIN,
 		basePath: BASE_PATH,
 		secret: `test-secret-${randomBase64Url(32)}`,
