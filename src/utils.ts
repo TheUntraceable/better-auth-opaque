@@ -1,7 +1,9 @@
 import { client, server } from "@serenity-kit/opaque";
-import { type Account, APIError } from "better-auth";
+import { type Account, APIError, type User } from "better-auth";
 import {
+	constantTimeEqual,
 	generateRandomString,
+	makeSignature,
 	symmetricDecrypt,
 	symmetricEncrypt,
 } from "better-auth/crypto";
@@ -27,7 +29,46 @@ export interface OpaqueOptions {
 		window?: number;
 		max?: number;
 	};
+	/**
+	 * Enables forgot/reset password by emailed LINK. Called for every existing
+	 * user (with or without an OPAQUE account) who requests a reset; never for
+	 * unknown emails. `url` points at `GET /opaque/reset-password/:token`,
+	 * which redirects to the requested `redirectTo` with `?token=`.
+	 */
+	sendResetPassword?: (
+		data: { user: User; url: string; token: string },
+		request?: Request,
+	) => Promise<void> | void;
+	/**
+	 * Enables forgot/reset password by emailed one-time CODE. Called for every
+	 * existing user who requests a reset; never for unknown emails.
+	 */
+	sendResetPasswordOTP?: (
+		data: { user: User; otp: string },
+		request?: Request,
+	) => Promise<void> | void;
+	/** Lifetime of a reset link token, in seconds. Default 3600. */
+	resetPasswordTokenExpiresIn?: number;
+	resetPasswordOTP?: {
+		/** Lifetime of a reset code, in seconds. Default 300. */
+		expiresIn?: number;
+		/** Number of digits. Default 6. */
+		length?: number;
+		/** Wrong guesses (challenge and complete combined) before the code is locked. Default 3. */
+		allowedAttempts?: number;
+	};
+	/**
+	 * Refuse OPAQUE login (403 `EMAIL_NOT_VERIFIED`, after the password proof
+	 * has been verified) until the user's email is verified. Defaults to Better
+	 * Auth's `emailAndPassword.requireEmailVerification`.
+	 */
+	requireEmailVerification?: boolean;
 }
+
+export const DEFAULT_RESET_TOKEN_EXPIRES_IN = 3600;
+export const DEFAULT_RESET_OTP_EXPIRES_IN = 300;
+export const DEFAULT_RESET_OTP_LENGTH = 6;
+export const DEFAULT_RESET_OTP_ALLOWED_ATTEMPTS = 3;
 
 export const REGISTRATION_REQUEST_LENGTH = 32;
 export const REGISTRATION_RECORD_MIN_LENGTH = 170;
@@ -91,6 +132,31 @@ export const OPAQUE_ERROR_CODES = {
 		code: "FAILED_TO_CREATE_SESSION",
 		message: "Failed to create session",
 	},
+	/** Reset password: unknown, expired, used or wrong link token / code (or not exactly one credential). */
+	INVALID_TOKEN: {
+		code: "INVALID_TOKEN",
+		message: "Invalid token",
+	},
+	/** Reset password: the code was guessed wrong too many times; request a new one. */
+	TOO_MANY_ATTEMPTS: {
+		code: "TOO_MANY_ATTEMPTS",
+		message: "Too many attempts",
+	},
+	/** Forgot password: the requested delivery method (link / otp) is not configured on the server. */
+	RESET_PASSWORD_METHOD_NOT_CONFIGURED: {
+		code: "RESET_PASSWORD_METHOD_NOT_CONFIGURED",
+		message: "This password reset method is not configured",
+	},
+	/** Set password: the user already has an OPAQUE password (use change password instead). */
+	OPAQUE_ACCOUNT_ALREADY_EXISTS: {
+		code: "OPAQUE_ACCOUNT_ALREADY_EXISTS",
+		message: "An OPAQUE password is already set for this user",
+	},
+	/** Login: correct password, but the email is not verified (requireEmailVerification). */
+	EMAIL_NOT_VERIFIED: {
+		code: "EMAIL_NOT_VERIFIED",
+		message: "Email not verified",
+	},
 } as const;
 
 export type OpaqueErrorCode = keyof typeof OPAQUE_ERROR_CODES;
@@ -105,6 +171,100 @@ export type LoginStatePurpose = keyof typeof NONCE_IDENTIFIER_PREFIX;
 
 export function nonceIdentifier(purpose: LoginStatePurpose, nonce: string) {
 	return `${NONCE_IDENTIFIER_PREFIX[purpose]}${nonce}`;
+}
+
+/**
+ * Verification-table identifiers of the password-reset / set-password flows.
+ * Deliberately distinct from core's `reset-password:` so an OPAQUE reset token
+ * is never accepted (or burnt) by core's `/reset-password`.
+ */
+export const RESET_TOKEN_IDENTIFIER_PREFIX = "opaque-reset-password:";
+export const RESET_OTP_IDENTIFIER_PREFIX = "opaque-reset-otp:";
+export const SET_PASSWORD_IDENTIFIER_PREFIX = "opaque-set-password:";
+
+/** base64url HMAC-SHA256 of `value` under `secret`, domain-separated by `purpose`. */
+export async function keyedHash(
+	secret: string,
+	purpose: string,
+	value: string,
+): Promise<string> {
+	const signature = await makeSignature(`${purpose}\u0000${value}`, secret);
+	return signature.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Link tokens are stored hashed (keyed by the auth secret): a leaked
+ * verification table does not yield usable reset links.
+ */
+export async function resetTokenIdentifier(secret: string, token: string) {
+	return `${RESET_TOKEN_IDENTIFIER_PREFIX}${await keyedHash(secret, "opaque-reset-token", token)}`;
+}
+
+export function resetOTPIdentifier(email: string) {
+	return `${RESET_OTP_IDENTIFIER_PREFIX}${normalizeEmail(email)}`;
+}
+
+export function setPasswordIdentifier(userId: string) {
+	return `${SET_PASSWORD_IDENTIFIER_PREFIX}${userId}`;
+}
+
+/** Keyed hash of an OTP, bound to the email it was issued for. */
+export function hashResetOTP(secret: string, email: string, otp: string) {
+	return keyedHash(secret, "opaque-reset-otp", `${normalizeEmail(email)}:${otp}`);
+}
+
+export interface ResetOTPRecord {
+	userId: string;
+	otpHash: string;
+	attempts: number;
+}
+
+export function encodeResetOTPRecord(record: ResetOTPRecord): string {
+	return JSON.stringify(record);
+}
+
+/** Parses a stored OTP record; `null` if it is malformed. Never throws. */
+export function decodeResetOTPRecord(value: string): ResetOTPRecord | null {
+	try {
+		const data = JSON.parse(value) as Partial<ResetOTPRecord> | null;
+		if (
+			!data ||
+			typeof data.userId !== "string" ||
+			typeof data.otpHash !== "string" ||
+			typeof data.attempts !== "number" ||
+			!Number.isInteger(data.attempts) ||
+			data.attempts < 0
+		) {
+			return null;
+		}
+		return { userId: data.userId, otpHash: data.otpHash, attempts: data.attempts };
+	} catch {
+		return null;
+	}
+}
+
+export function timingSafeEqualString(a: string, b: string): boolean {
+	return constantTimeEqual(a, b);
+}
+
+/**
+ * A copy of the request for user callbacks (the original body has usually
+ * been consumed by the time a callback runs). Mirrors core's `safeCloneRequest`.
+ */
+export function cloneRequest(request: Request | undefined): Request | undefined {
+	if (!request) return undefined;
+	try {
+		return request.clone() as Request;
+	} catch {
+		return new Request(request.url, {
+			headers: request.headers,
+			method: request.method,
+			redirect: request.redirect,
+			referrer: request.referrer,
+			referrerPolicy: request.referrerPolicy,
+			signal: request.signal,
+		});
+	}
 }
 
 /**
