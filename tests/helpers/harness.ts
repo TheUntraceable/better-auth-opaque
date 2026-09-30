@@ -15,7 +15,7 @@
  */
 import { client as opaqueLib, ready, server as opaqueServer } from "@serenity-kit/opaque";
 import { setDefaultTimeout } from "bun:test";
-import { betterAuth } from "better-auth";
+import { type BetterAuthOptions, betterAuth, type User } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { createAuthClient } from "better-auth/client";
 import { opaqueClient } from "../../src/client";
@@ -95,6 +95,11 @@ export class CookieJar {
 		this.store.clear();
 	}
 
+	/** Snapshot of the stored cookies (for copying into another jar). */
+	entries(): ParsedSetCookie[] {
+		return [...this.store.values()];
+	}
+
 	/** Serialise to a `Cookie` request header, optionally restricted to `only`. */
 	header(only?: string[]): string {
 		return [...this.store.values()]
@@ -142,10 +147,23 @@ function makeClient(fetchImpl: (input: string | URL | Request, init?: RequestIni
 	});
 }
 
+/** A request as it reached the auth handler (after origin/cookies were applied). */
+export interface LoggedRequest {
+	method: string;
+	/** Path relative to BASE_PATH, without the query string (e.g. "/sign-in/opaque/complete"). */
+	path: string;
+	url: string;
+	headers: Headers;
+	/** Parsed JSON body, or null. */
+	body: any;
+}
+
 export class Device {
 	readonly jar = new CookieJar();
 	/** Set-Cookie headers from the most recent response on this device. */
 	lastSetCookies: ParsedSetCookie[] = [];
+	/** Every request this device sent into the handler, in order. */
+	readonly requests: LoggedRequest[] = [];
 	/** Typed Better Auth client (with the opaque client plugin) bound to this device. */
 	readonly client: ReturnType<typeof makeClient>;
 
@@ -180,6 +198,20 @@ export class Device {
 			request.method === "GET" || request.method === "HEAD"
 				? undefined
 				: await request.text();
+		let parsedBody: any = null;
+		try {
+			parsedBody = body ? JSON.parse(body) : null;
+		} catch {
+			parsedBody = null;
+		}
+		const url = new URL(request.url);
+		this.requests.push({
+			method: request.method,
+			path: url.pathname.startsWith(BASE_PATH) ? url.pathname.slice(BASE_PATH.length) : url.pathname,
+			url: request.url,
+			headers,
+			body: parsedBody,
+		});
 		const response = await this.handler(
 			new Request(request.url, { method: request.method, headers, body }),
 		);
@@ -238,6 +270,21 @@ export class Device {
 			updateJar: false,
 		});
 		return { status: res.status, session: res.body };
+	}
+
+	/**
+	 * A new device holding a copy of this device's current cookies (e.g. to
+	 * keep replaying a session token after this device has been given a new one).
+	 */
+	fork(): Device {
+		const copy = new Device(this.handler);
+		copy.jar.apply(this.jar.entries());
+		return copy;
+	}
+
+	/** Requests sent to `path` (relative to BASE_PATH), in order. */
+	requestsTo(path: string): LoggedRequest[] {
+		return this.requests.filter((r) => r.path === path);
 	}
 
 	/** The raw session token (without the cookie signature). */
@@ -362,13 +409,198 @@ export async function startChangePassword(device: Device, currentPassword: strin
 	return { res, loginResult, registrationRecord, encryptedServerState: res.body.state };
 }
 
+/**
+ * A registration record of the valid length (192 bytes) whose client public
+ * key is not a valid group element, so it can never be deserialised by the
+ * OPAQUE server (unlike random bytes, which occasionally decode).
+ */
+export const UNDESERIALISABLE_RECORD = Buffer.alloc(192, 0xff).toString("base64url");
+
+/** How a password reset is authorised: a link token, or an emailed OTP. */
+export type ResetCredential = { token: string } | { email: string; otp: string };
+
+/**
+ * Step 1 of a raw password reset. Never throws on an HTTP error: returns the
+ * response and, if it was a 200, the registration record for `newPassword`.
+ */
+export async function startResetPassword(device: Device, credential: ResetCredential, newPassword: string) {
+	await ready;
+	const { clientRegistrationState, registrationRequest } = opaqueLib.startRegistration({ password: newPassword });
+	const res = await device.post<{ challenge: string }>("/opaque/reset-password/challenge", {
+		...credential,
+		registrationRequest,
+	});
+	const registrationRecord =
+		res.status === 200 && typeof res.body?.challenge === "string"
+			? opaqueLib.finishRegistration({
+					clientRegistrationState,
+					password: newPassword,
+					registrationResponse: res.body.challenge,
+				}).registrationRecord
+			: undefined;
+	return { res, registrationRecord };
+}
+
+/** A full raw password reset; throws if the challenge step is not a 200. */
+export async function rawResetPassword(device: Device, credential: ResetCredential, newPassword: string) {
+	const started = await startResetPassword(device, credential, newPassword);
+	if (!started.registrationRecord) {
+		throw new Error(`reset challenge failed: ${started.res.status} ${started.res.text}`);
+	}
+	const complete = await device.post("/opaque/reset-password/complete", {
+		...credential,
+		registrationRecord: started.registrationRecord,
+	});
+	return { challenge: started.res, complete, registrationRecord: started.registrationRecord };
+}
+
+/** Step 1 of a raw set-password (logged-in user without an OPAQUE account). Never throws on HTTP errors. */
+export async function startSetPassword(device: Device, newPassword: string) {
+	await ready;
+	const { clientRegistrationState, registrationRequest } = opaqueLib.startRegistration({ password: newPassword });
+	const res = await device.post<{ challenge: string }>("/opaque/setPassword/challenge", { registrationRequest });
+	const registrationRecord =
+		res.status === 200 && typeof res.body?.challenge === "string"
+			? opaqueLib.finishRegistration({
+					clientRegistrationState,
+					password: newPassword,
+					registrationResponse: res.body.challenge,
+				}).registrationRecord
+			: undefined;
+	return { res, registrationRecord };
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         Plugin options (the contract)                      */
+/* -------------------------------------------------------------------------- */
+
+export type Expect<T extends true> = T;
+export type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2 ? true : false;
+export type IsAny<T> = 0 extends 1 & T ? true : false;
+export type Extends<A, B> = [A] extends [B] ? true : false;
+
+export interface ResetLinkMail {
+	user: User;
+	url: string;
+	token: string;
+	request?: Request;
+}
+export interface ResetOTPMail {
+	user: User;
+	otp: string;
+	request?: Request;
+}
+export interface VerificationMail {
+	user: User;
+	url: string;
+	token: string;
+	request?: Request;
+}
+
+/**
+ * The server plugin options this suite is written against (the contract for
+ * the implementation). `OPAQUE_SERVER_KEY` is always supplied by the harness.
+ */
+export interface ContractPluginOptions {
+	insecureCreateSessionOnRegister?: boolean;
+	rateLimit?: { window?: number; max?: number };
+	/** Password reset by link. */
+	sendResetPassword?: (data: { user: User; url: string; token: string }, request?: Request) => Promise<void> | void;
+	/** Password reset by emailed one-time code. */
+	sendResetPasswordOTP?: (data: { user: User; otp: string }, request?: Request) => Promise<void> | void;
+	/** Link token lifetime in seconds. Default 3600. */
+	resetPasswordTokenExpiresIn?: number;
+	resetPasswordOTP?: {
+		/** Seconds. Default 300. */
+		expiresIn?: number;
+		/** Digits. Default 6. */
+		length?: number;
+		/** Default 3. */
+		allowedAttempts?: number;
+	};
+	/** Refuse OPAQUE login (403 EMAIL_NOT_VERIFIED) until the email is verified. Default false. */
+	requireEmailVerification?: boolean;
+}
+
+type ServerPluginOptions = NonNullable<Parameters<typeof opaque>[0]>;
+type ContractOptionSupported = {
+	[K in keyof ContractPluginOptions]-?: K extends keyof ServerPluginOptions
+		? Extends<ContractPluginOptions[K], ServerPluginOptions[K]>
+		: false;
+};
+/**
+ * Compile-time contract: every option above must exist on the real plugin
+ * options with a compatible type. (Fails `tsc -p tests` until implemented.)
+ */
+export type _PluginAcceptsContractOptions = Expect<
+	Equal<ContractOptionSupported[keyof ContractOptionSupported], true>
+>;
+
+export interface HarnessOptions {
+	/** Extra plugin options (merged over the defaults below). */
+	plugin?: ContractPluginOptions;
+	/** Install a capturing `sendResetPassword` (link). */
+	resetLink?: boolean;
+	/** Install a capturing `sendResetPasswordOTP`. */
+	resetOTP?: boolean;
+	/**
+	 * Enable Better Auth core `emailVerification` with a capturing
+	 * `sendVerificationEmail` and these flags.
+	 */
+	verification?: {
+		sendOnSignUp?: boolean;
+		sendOnSignIn?: boolean;
+		autoSignInAfterVerification?: boolean;
+	};
+	/** Enable core email + password (`/sign-up/email`, `/sign-in/email`). */
+	emailAndPassword?: boolean;
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                  Harness                                   */
 /* -------------------------------------------------------------------------- */
 
-export async function createTestHarness() {
+export async function createTestHarness(options: HarnessOptions = {}) {
 	await ready;
 	const serverSetup = opaqueServer.createSetup();
+	// Everything the auth instance "emailed", in order.
+	const outbox = {
+		resetLinks: [] as ResetLinkMail[],
+		resetOTPs: [] as ResetOTPMail[],
+		verificationEmails: [] as VerificationMail[],
+		resetLinksFor(email: string) {
+			return outbox.resetLinks.filter((m) => m.user.email.toLowerCase() === email.toLowerCase());
+		},
+		resetOTPsFor(email: string) {
+			return outbox.resetOTPs.filter((m) => m.user.email.toLowerCase() === email.toLowerCase());
+		},
+		verificationEmailsFor(email: string) {
+			return outbox.verificationEmails.filter((m) => m.user.email.toLowerCase() === email.toLowerCase());
+		},
+	};
+	const pluginOptions: ContractPluginOptions & { OPAQUE_SERVER_KEY: string } = {
+		...options.plugin,
+		OPAQUE_SERVER_KEY: serverSetup,
+	};
+	if (options.resetLink) {
+		pluginOptions.sendResetPassword = async ({ user, url, token }, request) => {
+			outbox.resetLinks.push({ user, url, token, request });
+		};
+	}
+	if (options.resetOTP) {
+		pluginOptions.sendResetPasswordOTP = async ({ user, otp }, request) => {
+			outbox.resetOTPs.push({ user, otp, request });
+		};
+	}
+	const emailVerification: BetterAuthOptions["emailVerification"] = options.verification
+		? {
+				...options.verification,
+				sendVerificationEmail: async ({ user, url, token }, request) => {
+					outbox.verificationEmails.push({ user, url, token, request });
+				},
+			}
+		: undefined;
+
 	// An explicit (per-harness) in-memory database. Without `database`, Better
 	// Auth 1.7 runs in *stateless* mode (JWE cookie cache valid for the whole
 	// session lifetime), which is not what a production deployment with a DB
@@ -385,7 +617,11 @@ export async function createTestHarness() {
 		advanced: { disableOriginCheck: false, disableCSRFCheck: false },
 		rateLimit: { enabled: false },
 		session: { cookieCache: { enabled: true, maxAge: 300 } },
-		plugins: [opaque({ OPAQUE_SERVER_KEY: serverSetup })],
+		...(options.emailAndPassword ? { emailAndPassword: { enabled: true } } : {}),
+		...(emailVerification ? { emailVerification } : {}),
+		// The cast only bridges the contract options above to the current
+		// plugin signature; `_PluginAcceptsContractOptions` checks them.
+		plugins: [opaque(pluginOptions as Parameters<typeof opaque>[0])],
 	});
 	const ctx = await auth.$context;
 	// Create every table in the resolved schema (core + plugins), mirroring
@@ -396,6 +632,14 @@ export async function createTestHarness() {
 	const db = {
 		async user(email: string) {
 			return (await ctx.internalAdapter.findUserByEmail(email))?.user ?? null;
+		},
+		async accounts(email: string) {
+			const user = await db.user(email);
+			if (!user) return [];
+			return ctx.internalAdapter.findAccounts(user.id);
+		},
+		async opaqueAccounts(email: string) {
+			return (await db.accounts(email)).filter((a) => a.providerId === "opaque");
 		},
 		async opaqueAccount(email: string) {
 			const user = await db.user(email);
@@ -421,12 +665,26 @@ export async function createTestHarness() {
 		async userCount() {
 			return ctx.adapter.count({ model: "user" });
 		},
+		/** Every row of the verification table (raw, as stored). */
+		verificationRows(): Array<{ id: string; identifier: string; value: string; expiresAt: Date }> {
+			return [...(memoryDB.verification ?? [])];
+		},
+		/** A user with NO accounts at all (as if created by another provider). */
+		async createUserWithoutOpaque(email: string, name = "No Opaque") {
+			return ctx.internalAdapter.createUser({ email, name, emailVerified: false }, { method: "admin" });
+		},
+		async setEmailVerified(email: string, emailVerified: boolean) {
+			const user = await db.user(email);
+			if (!user) throw new Error(`no user ${email}`);
+			await ctx.internalAdapter.updateUser(user.id, { emailVerified });
+		},
 	};
 
 	return {
 		auth,
 		ctx,
 		db,
+		outbox,
 		serverSetup,
 		device: () => new Device(handler),
 		/** Register via the typed client on a throwaway device; asserts success. */
@@ -444,6 +702,19 @@ export async function createTestHarness() {
 			const res = await d.client.signIn.opaque({ email, password });
 			if (res.error || !res.data) {
 				throw new Error(`login of ${email} failed: ${JSON.stringify(res.error)}`);
+			}
+			return d;
+		},
+		/**
+		 * Sign up through core `/sign-up/email` (requires `emailAndPassword`):
+		 * a user with a "credential" account and NO OPAQUE account, logged in
+		 * on the returned device.
+		 */
+		async coreSignUp(email: string, password = "core-password-123", name = "Core User") {
+			const d = new Device(handler);
+			const res = await d.post("/sign-up/email", { email, password, name });
+			if (res.status !== 200 || !d.sessionToken()) {
+				throw new Error(`core sign-up of ${email} failed: ${res.status} ${res.text}`);
 			}
 			return d;
 		},

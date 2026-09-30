@@ -169,4 +169,20 @@ describe("register", () => {
 		expect(res.error).toMatchObject({ status: 400 });
 		expect(await h.db.user(email)).toBeNull();
 	});
+
+	test("mixed-case email: registers once, and login succeeds with lower-, upper- and exact-case email", async () => {
+		const exact = `MiXeD.CaSe-${randomBase64Url(6).replace(/[-_]/g, "x")}@Example.Test`;
+		const res = await h.device().client.signUp.opaque({ email: exact, password: "pw-mixed-case", name: "Mixed" });
+		expect(res.error).toBeNull();
+
+		const user = await h.db.user(exact.toLowerCase());
+		expect(user).not.toBeNull();
+		expect(user!.email).toBe(exact.toLowerCase());
+
+		for (const variant of [exact.toLowerCase(), exact.toUpperCase(), exact]) {
+			const login = await h.device().client.signIn.opaque({ email: variant, password: "pw-mixed-case" });
+			expect({ variant, error: login.error }).toEqual({ variant, error: null });
+			expect(login.data?.user.id).toBe(user!.id);
+		}
+	});
 });

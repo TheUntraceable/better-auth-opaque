@@ -4,8 +4,11 @@ import {
 	createTestHarness,
 	type Device,
 	randomBase64Url,
+	SESSION_DATA_COOKIE,
+	SESSION_TOKEN_COOKIE,
 	startChangePassword,
 	uniqueEmail,
+	validLoginPayload,
 } from "./helpers/harness";
 
 const h = await createTestHarness();
@@ -51,10 +54,10 @@ describe("change password: authentication", () => {
 		expect(complete.status).toBe(401);
 	});
 
-	test("unauthenticated client call returns an error and no data", async () => {
-		const res = await h.device().client.changePassword({ currentPassword: OLD_PASSWORD, newPassword: NEW_PASSWORD });
+	test("unauthenticated client call returns a 401 error and no data", async () => {
+		const res = await h.device().client.opaque.changePassword({ currentPassword: OLD_PASSWORD, newPassword: NEW_PASSWORD });
 		expect(res.data).toBeNull();
-		expect(res.error).not.toBeNull();
+		expect(res.error).toMatchObject({ status: 401 });
 	});
 });
 
@@ -64,10 +67,10 @@ describe("change password: wrong current password", () => {
 		const device = devices[0]!;
 		const recordBefore = await h.db.registrationRecord(email);
 
-		const res = await device.client.changePassword({ currentPassword: "not the password", newPassword: NEW_PASSWORD });
+		const res = await device.client.opaque.changePassword({ currentPassword: "not the password", newPassword: NEW_PASSWORD });
 
 		expect(res.data).toBeNull();
-		expect(res.error).not.toBeNull();
+		expect(res.error).toMatchObject({ status: 401, code: "INVALID_CURRENT_PASSWORD" });
 		expect(await h.db.registrationRecord(email)).toBe(recordBefore);
 		expect((await device.whoami({ tokenOnly: true })).session?.user.email).toBe(email);
 		expect(await canLogIn(email, OLD_PASSWORD)).toBe(true);
@@ -117,12 +120,10 @@ describe("change password: success", () => {
 		const { email, devices } = await userWithDevices(1);
 		const recordBefore = await h.db.registrationRecord(email);
 
-		const res = await devices[0]!.client.changePassword({ currentPassword: OLD_PASSWORD, newPassword: NEW_PASSWORD });
+		const res = await devices[0]!.client.opaque.changePassword({ currentPassword: OLD_PASSWORD, newPassword: NEW_PASSWORD });
 
 		expect(res.error).toBeNull();
-		// `as unknown`: the plugin's `changePassword` action collides with Better
-		// Auth core's `changePassword` in the client's inferred types.
-		expect(res.data as unknown).toEqual({ success: true, message: "Password changed successfully" });
+		expect(res.data).toEqual({ success: true, message: "Password changed successfully" });
 		const recordAfter = await h.db.registrationRecord(email);
 		expect(recordAfter).not.toBeNull();
 		expect(recordAfter).not.toBe(recordBefore);
@@ -139,7 +140,7 @@ describe("change password: success", () => {
 			expect((await d.whoami({ tokenOnly: true })).session?.user.email).toBe(email);
 		}
 
-		const res = await changer.client.changePassword({ currentPassword: OLD_PASSWORD, newPassword: NEW_PASSWORD });
+		const res = await changer.client.opaque.changePassword({ currentPassword: OLD_PASSWORD, newPassword: NEW_PASSWORD });
 		expect(res.error).toBeNull();
 
 		const remaining = (await h.db.sessionsFor(email)).map((s) => s.token);
@@ -153,7 +154,7 @@ describe("change password: success", () => {
 		const { email, devices } = await userWithDevices(2);
 		const [changer] = devices as [Device, Device];
 
-		const res = await changer.client.changePassword({ currentPassword: OLD_PASSWORD, newPassword: NEW_PASSWORD });
+		const res = await changer.client.opaque.changePassword({ currentPassword: OLD_PASSWORD, newPassword: NEW_PASSWORD });
 		expect(res.error).toBeNull();
 
 		// Whatever token the changer now holds (kept or rotated) must be live in the DB.
@@ -208,5 +209,134 @@ describe("change password: state integrity", () => {
 		const replay = await device.post("/opaque/changePassword/complete", payload);
 		expect(isClientError(replay.status)).toBe(true);
 		expect(await h.db.registrationRecord(email)).toBe(recordAfterFirst);
+	});
+});
+
+/** Change the password over raw HTTP from `device`; asserts a 200. */
+async function rawChangePassword(device: Device, extra: { revokeOtherSessions?: boolean } = {}) {
+	const started = await startChangePassword(device, OLD_PASSWORD, NEW_PASSWORD);
+	expect(started.loginResult).toBeDefined();
+	const res = await device.post("/opaque/changePassword/complete", {
+		loginResult: started.loginResult,
+		registrationRecord: started.registrationRecord,
+		encryptedServerState: started.encryptedServerState,
+		...extra,
+	});
+	expect(res.status).toBe(200);
+	return res;
+}
+
+describe("change password: session token rotation", () => {
+	test("success issues a NEW session token to the caller, and it works", async () => {
+		const { email, devices } = await userWithDevices(1);
+		const changer = devices[0]!;
+		const before = changer.sessionToken();
+		expect(before).toBeDefined();
+
+		const res = await rawChangePassword(changer);
+
+		// Fresh cookies were set by the response itself.
+		expect(res.setCookies.map((c) => c.name)).toContain(SESSION_TOKEN_COOKIE);
+		expect(res.setCookies.map((c) => c.name)).toContain(SESSION_DATA_COOKIE);
+		const after = changer.sessionToken();
+		expect(after).toBeDefined();
+		expect(after).not.toBe(before!);
+
+		const fromDb = await changer.whoami({ tokenOnly: true });
+		expect(fromDb.session?.user.email).toBe(email);
+		expect(fromDb.session?.session.token).toBe(after!);
+		// The cookie cache was rebuilt for the new session too.
+		const cached = await changer.whoami();
+		expect(cached.session?.user.email).toBe(email);
+		expect(cached.session?.session.token).toBe(after!);
+	});
+
+	test("the session token that made the request is deleted", async () => {
+		const { email, devices } = await userWithDevices(1);
+		const changer = devices[0]!;
+		const oldToken = changer.sessionToken()!;
+		const oldCookies = changer.fork(); // keeps replaying the pre-change cookies
+
+		await rawChangePassword(changer);
+
+		expect((await h.db.sessionsFor(email)).map((s) => s.token)).not.toContain(oldToken);
+		expect((await oldCookies.whoami({ tokenOnly: true })).session).toBeNull();
+	});
+
+	test("the old token is dead even with revokeOtherSessions: false", async () => {
+		const { email, devices } = await userWithDevices(1);
+		const changer = devices[0]!;
+		const oldToken = changer.sessionToken()!;
+		const oldCookies = changer.fork();
+
+		await rawChangePassword(changer, { revokeOtherSessions: false });
+
+		expect(changer.sessionToken()).not.toBe(oldToken);
+		expect((await h.db.sessionsFor(email)).map((s) => s.token)).not.toContain(oldToken);
+		expect((await oldCookies.whoami({ tokenOnly: true })).session).toBeNull();
+		expect((await changer.whoami({ tokenOnly: true })).session?.user.email).toBe(email);
+	});
+
+	test("revokeOtherSessions: false keeps other devices' sessions in the database", async () => {
+		const { email, devices } = await userWithDevices(3);
+		const [changer, phone, laptop] = devices as [Device, Device, Device];
+		const otherTokens = [phone.sessionToken()!, laptop.sessionToken()!];
+
+		await rawChangePassword(changer, { revokeOtherSessions: false });
+
+		const remaining = (await h.db.sessionsFor(email)).map((s) => s.token).sort();
+		expect(remaining).toEqual([...otherTokens, changer.sessionToken()!].sort());
+		for (const d of [phone, laptop]) {
+			expect((await d.whoami({ tokenOnly: true })).session?.user.email).toBe(email);
+		}
+	});
+
+	test("default (revokeOtherSessions omitted) revokes other devices and leaves only the caller's new session", async () => {
+		const { email, devices } = await userWithDevices(3);
+		const [changer, phone, laptop] = devices as [Device, Device, Device];
+		const tokensBefore = devices.map((d) => d.sessionToken()!);
+
+		await rawChangePassword(changer);
+
+		const remaining = (await h.db.sessionsFor(email)).map((s) => s.token);
+		expect(remaining).toEqual([changer.sessionToken()!]);
+		for (const t of tokensBefore) expect(remaining).not.toContain(t);
+		for (const d of [phone, laptop]) {
+			expect((await d.whoami({ tokenOnly: true })).session).toBeNull();
+		}
+	});
+
+	test("a caller who logged in with dontRememberMe gets a rotated session cookie without Max-Age", async () => {
+		const email = uniqueEmail("chpw-dontremember");
+		await h.register(email, OLD_PASSWORD);
+		const changer = h.device();
+		const login = await changer.post("/sign-in/opaque/complete", {
+			...(await validLoginPayload(changer, email, OLD_PASSWORD)),
+			dontRememberMe: true,
+		});
+		expect(login.status).toBe(200);
+		const before = changer.sessionToken();
+
+		const res = await rawChangePassword(changer);
+
+		const tokenCookie = res.setCookies.find((c) => c.name === SESSION_TOKEN_COOKIE);
+		expect(tokenCookie).toBeDefined();
+		expect(changer.sessionToken()).not.toBe(before!);
+		expect(tokenCookie!.attributes["max-age"]).toBeUndefined();
+		expect(tokenCookie!.attributes.expires).toBeUndefined();
+		expect((await changer.whoami({ tokenOnly: true })).session?.user.email).toBe(email);
+	});
+
+	test("a caller who logged in normally gets a persistent rotated cookie", async () => {
+		const { devices } = await userWithDevices(1);
+		const changer = devices[0]!;
+		const before = changer.sessionToken();
+
+		const res = await rawChangePassword(changer);
+
+		const tokenCookie = res.setCookies.find((c) => c.name === SESSION_TOKEN_COOKIE);
+		expect(tokenCookie).toBeDefined();
+		expect(changer.sessionToken()).not.toBe(before!);
+		expect(Number(tokenCookie!.attributes["max-age"])).toBeGreaterThan(0);
 	});
 });
