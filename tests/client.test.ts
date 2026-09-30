@@ -9,10 +9,12 @@
  */
 import { ready } from "@serenity-kit/opaque";
 import { describe, expect, mock, test } from "bun:test";
+import type { OpaqueClientResult, StatusData } from "../src/client";
 import { OPAQUE_ERROR_CODES } from "../src/utils";
 import {
 	createTestHarness,
 	type Device,
+	type Equal,
 	type Expect,
 	type Extends,
 	type IsAny,
@@ -22,7 +24,13 @@ import {
 
 await ready;
 
-const h = await createTestHarness({ resetLink: true, emailAndPassword: true });
+const h = await createTestHarness({
+	resetLink: true,
+	emailAndPassword: true,
+	plugin: { setPassword: { enabled: true } },
+});
+/** Sessions are created on registration (for the session-signal test). */
+const hAutoSession = await createTestHarness({ plugin: { insecureCreateSessionOnRegister: true } });
 
 const PASSWORD = "client password";
 const NEW_PASSWORD = "client new password";
@@ -35,8 +43,22 @@ type ChangePasswordData = NonNullable<ChangePasswordResult["data"]>;
 // `data` of opaque.changePassword is typed (not any) as { success: boolean; message: string }.
 export type _ChangePasswordDataNotAny = Expect<Extends<IsAny<ChangePasswordData>, false>>;
 export type _ChangePasswordDataShape = Expect<Extends<ChangePasswordData, { success: boolean; message: string }>>;
-// $InferServerPlugin is restored: the client's $ERROR_CODES type includes every OPAQUE code.
+// The client's $ERROR_CODES type includes every OPAQUE code.
 export type _ErrorCodesInferred = Expect<Extends<keyof typeof OPAQUE_ERROR_CODES, keyof Client["$ERROR_CODES"]>>;
+// Actions have exactly the action's type (not intersected with the inferred endpoint).
+export type _ForgetPasswordReturn = Expect<
+	Equal<ReturnType<Client["opaque"]["forgetPassword"]>, Promise<OpaqueClientResult<StatusData>>>
+>;
+// The OPAQUE endpoints are only reachable through the actions: the client type
+// exposes no raw path-proxy calls for their individual steps.
+export function _noRawEndpointCalls(client: Client) {
+	// @ts-expect-error not part of the client type
+	client.signIn.opaque.challenge;
+	// @ts-expect-error not part of the client type
+	client.opaque.resetPassword.challenge;
+	// @ts-expect-error not part of the client type
+	client.opaque.forgetPassword.challenge;
+}
 
 /* --------------------------------- helpers -------------------------------- */
 
@@ -61,16 +83,31 @@ describe("error codes", () => {
 	test("OPAQUE_ERROR_CODES includes the codes used by the new endpoints", () => {
 		for (const code of [
 			"INVALID_TOKEN",
-			"TOO_MANY_ATTEMPTS",
 			"RESET_PASSWORD_METHOD_NOT_CONFIGURED",
 			"OPAQUE_ACCOUNT_ALREADY_EXISTS",
 			"EMAIL_NOT_VERIFIED",
+			"SET_PASSWORD_CHALLENGE_REQUIRED",
 		]) {
 			const entry = (OPAQUE_ERROR_CODES as Record<string, { code: string; message: string } | undefined>)[code];
 			expect({ key: code, code: entry?.code, hasMessage: typeof entry?.message === "string" }).toEqual({
 				key: code,
 				code,
 				hasMessage: true,
+			});
+		}
+	});
+
+	test("TOO_MANY_ATTEMPTS is gone (a locked code answers INVALID_TOKEN, like an unknown one)", () => {
+		expect(Object.keys(OPAQUE_ERROR_CODES)).not.toContain("TOO_MANY_ATTEMPTS");
+	});
+
+	test("authClient.$ERROR_CODES also exposes Better Auth's core codes at runtime", () => {
+		const codes = h.device().client.$ERROR_CODES as unknown as Record<string, { code?: unknown; message?: unknown } | undefined>;
+		for (const key of ["INVALID_ORIGIN", "USER_NOT_FOUND"]) {
+			expect({ key, code: codes[key]?.code, message: typeof codes[key]?.message }).toEqual({
+				key,
+				code: key,
+				message: "string",
 			});
 		}
 	});
@@ -173,6 +210,46 @@ describe("signIn.opaque", () => {
 		expect(res.data).toBeNull();
 		expect(res.error).toMatchObject({ status: 400 });
 	});
+
+	test("success notifies the client's session signal once (useSession refetches)", async () => {
+		const { email } = await registered("c-si-signal");
+		const device = h.device();
+		let signals = 0;
+		const unlisten = device.client.$store.atoms.$sessionSignal!.listen(() => {
+			signals += 1;
+		});
+		const res = await device.client.signIn.opaque({ email, password: PASSWORD });
+		unlisten();
+		expect(res.error).toBeNull();
+		expect(signals).toBe(1);
+	});
+
+	test("a failure detected locally (wrong password) fires onError exactly once, and onSuccess never", async () => {
+		const { email } = await registered("c-si-onerror");
+		const onError = mock(() => {});
+		const onSuccess = mock(() => {});
+		const res = await h.device().client.signIn.opaque({ email, password: "wrong password" }, { onError, onSuccess });
+		expect(res.error).toMatchObject({ status: 401, code: "INVALID_EMAIL_OR_PASSWORD" });
+		expect(onError).toHaveBeenCalledTimes(1);
+		expect(onSuccess).toHaveBeenCalledTimes(0);
+	});
+});
+
+describe("signUp.opaque with insecureCreateSessionOnRegister", () => {
+	test("notifies the client's session signal, so useSession reflects the new session without an extra call", async () => {
+		const device = hAutoSession.device();
+		let signals = 0;
+		const unlisten = device.client.$store.atoms.$sessionSignal!.listen(() => {
+			signals += 1;
+		});
+		const email = uniqueEmail("c-su-signal");
+		const res = await device.client.signUp.opaque({ email, name: "Signal", password: PASSWORD });
+		unlisten();
+		expect(res.error).toBeNull();
+		expect(device.jar.has(SESSION_TOKEN_COOKIE)).toBe(true);
+		expect(signals).toBe(1);
+		expect((await device.whoami({ tokenOnly: true })).session?.user.email).toBe(email);
+	});
 });
 
 /* -------------------------- opaque.changePassword ------------------------- */
@@ -231,7 +308,7 @@ describe("opaque.changePassword", () => {
 			revokeOtherSessions: false,
 		});
 		expect(keep.error).toBeNull();
-		expect(changer.requestsTo("/opaque/changePassword/complete").at(-1)!.body.revokeOtherSessions).toBe(false);
+		expect(changer.requestsTo("/opaque/change-password/complete").at(-1)!.body.revokeOtherSessions).toBe(false);
 		expect((await other.whoami({ tokenOnly: true })).session?.user.email).toBe(email);
 
 		const revoke = await changer.client.opaque.changePassword({ currentPassword: NEW_PASSWORD, newPassword: PASSWORD });
@@ -283,7 +360,7 @@ describe("fetchOptions passthrough (second argument)", () => {
 		const from = device.requests.length;
 		const res = await device.client.signUp.opaque({ email: uniqueEmail("c-fo-su"), name: "F", password: PASSWORD }, options);
 		expect(res.error).toBeNull();
-		expect(onSuccess).toHaveBeenCalled();
+		expect(onSuccess).toHaveBeenCalledTimes(1);
 		expectHeaderOnEveryRequest(device, from);
 	});
 
@@ -294,7 +371,7 @@ describe("fetchOptions passthrough (second argument)", () => {
 		const from = device.requests.length;
 		const res = await device.client.signIn.opaque({ email, password: PASSWORD }, options);
 		expect(res.error).toBeNull();
-		expect(onSuccess).toHaveBeenCalled();
+		expect(onSuccess).toHaveBeenCalledTimes(1);
 		expectHeaderOnEveryRequest(device, from);
 	});
 
@@ -305,7 +382,7 @@ describe("fetchOptions passthrough (second argument)", () => {
 		const from = device.requests.length;
 		const res = await device.client.opaque.changePassword({ currentPassword: PASSWORD, newPassword: NEW_PASSWORD }, options);
 		expect(res.error).toBeNull();
-		expect(onSuccess).toHaveBeenCalled();
+		expect(onSuccess).toHaveBeenCalledTimes(1);
 		expectHeaderOnEveryRequest(device, from);
 	});
 
@@ -316,7 +393,7 @@ describe("fetchOptions passthrough (second argument)", () => {
 		const from = device.requests.length;
 		const res = await device.client.opaque.forgetPassword({ email }, options);
 		expect(res.error).toBeNull();
-		expect(onSuccess).toHaveBeenCalled();
+		expect(onSuccess).toHaveBeenCalledTimes(1);
 		expectHeaderOnEveryRequest(device, from);
 	});
 
@@ -330,7 +407,7 @@ describe("fetchOptions passthrough (second argument)", () => {
 		const from = device.requests.length;
 		const res = await device.client.opaque.resetPassword({ token: link!.token, newPassword: NEW_PASSWORD }, options);
 		expect(res.error).toBeNull();
-		expect(onSuccess).toHaveBeenCalled();
+		expect(onSuccess).toHaveBeenCalledTimes(1);
 		expectHeaderOnEveryRequest(device, from);
 	});
 
@@ -340,7 +417,7 @@ describe("fetchOptions passthrough (second argument)", () => {
 		const from = device.requests.length;
 		const res = await device.client.opaque.setPassword({ newPassword: NEW_PASSWORD }, options);
 		expect(res.error).toBeNull();
-		expect(onSuccess).toHaveBeenCalled();
+		expect(onSuccess).toHaveBeenCalledTimes(1);
 		expectHeaderOnEveryRequest(device, from);
 	});
 });

@@ -6,6 +6,7 @@ import {
 	SESSION_DATA_COOKIE,
 	SESSION_TOKEN_COOKIE,
 	startLogin,
+	UNDESERIALISABLE_RECORD,
 	uniqueEmail,
 	validLoginPayload,
 } from "./helpers/harness";
@@ -191,13 +192,31 @@ describe("login: failures", () => {
 		expect(res.status).toBe(400);
 	});
 
-	test("an expired login state is rejected with 400 even when the KE3 is valid", async () => {
+	test("an expired login state is rejected with 400 LOGIN_STATE_EXPIRED even when the KE3 is valid", async () => {
 		const { email } = await registeredUser();
 		const payload = await validLoginPayload(h.device(), email, PASSWORD);
 
 		setSystemTime(new Date(Date.now() + 60 * 60 * 1000)); // one hour later
 		const res = await expectRejectedWithoutSession(payload);
 		expect(res.status).toBe(400);
+		expect(res.body?.code).toBe("LOGIN_STATE_EXPIRED");
+	});
+
+	test("a corrupt stored registration record: the challenge still answers 200 and login fails with 401 (never 500), no session", async () => {
+		const { email } = await registeredUser("login-corrupt");
+		const account = (await h.db.opaqueAccount(email))!;
+		await h.ctx.internalAdapter.updateAccount(account.id, { registrationRecord: UNDESERIALISABLE_RECORD } as Record<string, unknown>);
+		expect(await h.db.registrationRecord(email)).toBe(UNDESERIALISABLE_RECORD);
+
+		const started = await startLogin(h.device(), email, PASSWORD);
+		expect(started.res.status).toBe(200);
+		expect(started.finish()).toBeUndefined();
+		const forged = await expectRejectedWithoutSession(await forgedLoginPayload(h.device(), email));
+		expect({ status: forged.status, code: forged.body?.code }).toEqual({ status: 401, code: "INVALID_EMAIL_OR_PASSWORD" });
+
+		const viaClient = await h.device().client.signIn.opaque({ email, password: PASSWORD });
+		expect(viaClient.data).toBeNull();
+		expect(viaClient.error).toMatchObject({ status: 401, code: "INVALID_EMAIL_OR_PASSWORD" });
 	});
 });
 

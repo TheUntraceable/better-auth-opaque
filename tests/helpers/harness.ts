@@ -19,10 +19,11 @@ import { type BetterAuthOptions, betterAuth, type User } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { createAuthClient } from "better-auth/client";
 import { opaqueClient } from "../../src/client";
-import { opaque } from "../../src/server";
+import { type OpaqueOptions, opaque } from "../../src/server";
 
-// Each OPAQUE client operation runs a key-stretching KSF (~0.3s); flows that
-// register and log in several devices easily exceed bun's 5s default.
+// With the library-default key stretching every OPAQUE client operation runs
+// Argon2id (~0.3s); flows that register and log in several devices easily
+// exceed bun's 5s default.
 setDefaultTimeout(30_000);
 
 export const ORIGIN = "http://localhost:3000";
@@ -139,12 +140,107 @@ export interface RawResponse<T = any> {
 
 type Handler = (request: Request) => Promise<Response>;
 
-function makeClient(fetchImpl: (input: string | URL | Request, init?: RequestInit) => Promise<Response>) {
+/* -------------------------------------------------------------------------- */
+/*                               Key stretching                               */
+/* -------------------------------------------------------------------------- */
+
+export type KeyStretching = NonNullable<Parameters<typeof opaqueLib.finishLogin>[0]["keyStretching"]>;
+
+/**
+ * A deliberately weak Argon2id configuration for the test suite only: the
+ * library default costs ~0.3s per client operation, which dominates the suite.
+ * Every typed client (via `opaqueClient({ keyStretching })`) and every raw
+ * helper below use the same configuration, so records and logins agree.
+ */
+export const FAST_KEY_STRETCHING: KeyStretching = {
+	"argon2id-custom": { iterations: 1, memory: 256, parallelism: 1 },
+};
+
+type OpaqueClientOptions = NonNullable<Parameters<typeof opaqueClient>[0]>;
+
+/**
+ * Whether `opaqueClient({ keyStretching })` really forwards the option to the
+ * OPAQUE client library. Probed once, entirely in-process (a fake server
+ * answers the typed client's sign-up): the record the client produced must be
+ * usable by a login that stretches with FAST_KEY_STRETCHING.
+ *
+ * The raw helpers only switch to FAST_KEY_STRETCHING when it is, so the
+ * rest of the suite never mixes configurations (a client that ignored the
+ * option would otherwise make every raw login fail). The option itself is
+ * tested directly in key-stretching.test.ts, without this probe.
+ */
+async function probeClientKeyStretching(): Promise<boolean> {
+	await ready;
+	const setup = opaqueServer.createSetup();
+	const email = "key-stretching-probe@example.test";
+	const password = "key stretching probe";
+	let registrationRecord: string | undefined;
+	const probeClient = createAuthClient({
+		baseURL: `${ORIGIN}${BASE_PATH}`,
+		plugins: [opaqueClient({ keyStretching: FAST_KEY_STRETCHING } as OpaqueClientOptions)],
+		fetchOptions: {
+			customFetchImpl: async (input, init) => {
+				const request = input instanceof Request ? new Request(input, init) : new Request(input.toString(), init);
+				const body = (await request.json()) as { registrationRequest: string; registrationRecord: string };
+				if (request.url.endsWith("/sign-up/opaque/challenge")) {
+					const { registrationResponse } = opaqueServer.createRegistrationResponse({
+						serverSetup: setup,
+						userIdentifier: email,
+						registrationRequest: body.registrationRequest,
+					});
+					return Response.json({ challenge: registrationResponse });
+				}
+				registrationRecord = body.registrationRecord;
+				return Response.json({ success: true, message: "User registered successfully" });
+			},
+		},
+	});
+	await probeClient.signUp.opaque({ email, name: "probe", password });
+	if (!registrationRecord) return false;
+	const { clientLoginState, startLoginRequest } = opaqueLib.startLogin({ password });
+	const { loginResponse } = opaqueServer.startLogin({
+		serverSetup: setup,
+		userIdentifier: email,
+		registrationRecord,
+		startLoginRequest,
+	});
+	try {
+		return !!opaqueLib.finishLogin({ clientLoginState, loginResponse, password, keyStretching: FAST_KEY_STRETCHING });
+	} catch {
+		return false;
+	}
+}
+
+export const CLIENT_FORWARDS_KEY_STRETCHING = await probeClientKeyStretching();
+
+/** What the raw helpers pass to `finishRegistration` / `finishLogin` (undefined = library default). */
+export const RAW_KEY_STRETCHING: KeyStretching | undefined = CLIENT_FORWARDS_KEY_STRETCHING
+	? FAST_KEY_STRETCHING
+	: undefined;
+
+function makeClient(
+	fetchImpl: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
+	keyStretching: KeyStretching | "library-default" = FAST_KEY_STRETCHING,
+) {
 	return createAuthClient({
 		baseURL: `${ORIGIN}${BASE_PATH}`,
-		plugins: [opaqueClient()],
+		plugins: [
+			keyStretching === "library-default"
+				? opaqueClient()
+				: opaqueClient({ keyStretching } as OpaqueClientOptions),
+		],
 		fetchOptions: { customFetchImpl: fetchImpl },
 	});
+}
+
+export interface DeviceOptions {
+	/**
+	 * Key stretching of this device's typed client. Default FAST_KEY_STRETCHING;
+	 * "library-default" builds `opaqueClient()` without the option.
+	 */
+	keyStretching?: KeyStretching | "library-default";
+	/** Sent as `x-forwarded-for` on every request (rate limiting is per IP). */
+	ip?: string;
 }
 
 /** A request as it reached the auth handler (after origin/cookies were applied). */
@@ -167,12 +263,17 @@ export class Device {
 	/** Typed Better Auth client (with the opaque client plugin) bound to this device. */
 	readonly client: ReturnType<typeof makeClient>;
 
-	constructor(private readonly handler: Handler) {
-		this.client = makeClient((input, init) =>
-			this.dispatch(
-				input instanceof Request ? new Request(input, init) : new Request(input.toString(), init),
-				{},
-			),
+	constructor(
+		private readonly handler: Handler,
+		private readonly options: DeviceOptions = {},
+	) {
+		this.client = makeClient(
+			(input, init) =>
+				this.dispatch(
+					input instanceof Request ? new Request(input, init) : new Request(input.toString(), init),
+					{},
+				),
+			options.keyStretching,
 		);
 	}
 
@@ -193,6 +294,7 @@ export class Device {
 				: this.jar.header(mode === "token-only" ? [SESSION_TOKEN_COOKIE] : undefined);
 		if (cookie) headers.set("cookie", cookie);
 		else headers.delete("cookie");
+		if (this.options.ip) headers.set("x-forwarded-for", this.options.ip);
 
 		const body =
 			request.method === "GET" || request.method === "HEAD"
@@ -277,7 +379,7 @@ export class Device {
 	 * keep replaying a session token after this device has been given a new one).
 	 */
 	fork(): Device {
-		const copy = new Device(this.handler);
+		const copy = new Device(this.handler, this.options);
 		copy.jar.apply(this.jar.entries());
 		return copy;
 	}
@@ -321,7 +423,14 @@ export interface LoginPayload {
  * Real OPAQUE registration over raw HTTP. Returns both responses and the
  * registration record the client produced.
  */
-export async function rawRegister(device: Device, email: string, password: string, name = "Test User") {
+export async function rawRegister(
+	device: Device,
+	email: string,
+	password: string,
+	name = "Test User",
+	/** Extra fields for the complete step (e.g. `user.additionalFields`, `callbackURL`). */
+	extra: Record<string, unknown> = {},
+) {
 	await ready;
 	const { clientRegistrationState, registrationRequest } = opaqueLib.startRegistration({ password });
 	const challenge = await device.post("/sign-up/opaque/challenge", { email, registrationRequest });
@@ -332,8 +441,9 @@ export async function rawRegister(device: Device, email: string, password: strin
 		clientRegistrationState,
 		password,
 		registrationResponse: challenge.body.challenge,
+		keyStretching: RAW_KEY_STRETCHING,
 	});
-	const complete = await device.post("/sign-up/opaque/complete", { email, name, registrationRecord });
+	const complete = await device.post("/sign-up/opaque/complete", { ...extra, email, name, registrationRecord });
 	return { challenge, complete, registrationRecord };
 }
 
@@ -358,6 +468,7 @@ export async function startLogin(device: Device, email: string, password: string
 				clientLoginState,
 				loginResponse: res.body.challenge,
 				password,
+				keyStretching: RAW_KEY_STRETCHING,
 			})?.finishLoginRequest,
 	};
 }
@@ -382,7 +493,7 @@ export async function forgedLoginPayload(device: Device, email: string): Promise
 
 /**
  * Raw change-password challenge for a logged-in device. Returns everything
- * needed to call `/opaque/changePassword/complete`; `loginResult` is
+ * needed to call `/opaque/change-password/complete`; `loginResult` is
  * undefined when `currentPassword` is wrong (the client cannot produce KE3).
  */
 export async function startChangePassword(device: Device, currentPassword: string, newPassword: string) {
@@ -390,7 +501,7 @@ export async function startChangePassword(device: Device, currentPassword: strin
 	const login = opaqueLib.startLogin({ password: currentPassword });
 	const registration = opaqueLib.startRegistration({ password: newPassword });
 	const res = await device.post<{ loginChallenge: string; registrationChallenge: string; state: string }>(
-		"/opaque/changePassword/challenge",
+		"/opaque/change-password/challenge",
 		{ loginRequest: login.startLoginRequest, registrationRequest: registration.registrationRequest },
 	);
 	if (res.status !== 200) {
@@ -400,11 +511,13 @@ export async function startChangePassword(device: Device, currentPassword: strin
 		clientLoginState: login.clientLoginState,
 		loginResponse: res.body.loginChallenge,
 		password: currentPassword,
+		keyStretching: RAW_KEY_STRETCHING,
 	})?.finishLoginRequest;
 	const { registrationRecord } = opaqueLib.finishRegistration({
 		clientRegistrationState: registration.clientRegistrationState,
 		registrationResponse: res.body.registrationChallenge,
 		password: newPassword,
+		keyStretching: RAW_KEY_STRETCHING,
 	});
 	return { res, loginResult, registrationRecord, encryptedServerState: res.body.state };
 }
@@ -436,6 +549,7 @@ export async function startResetPassword(device: Device, credential: ResetCreden
 					clientRegistrationState,
 					password: newPassword,
 					registrationResponse: res.body.challenge,
+					keyStretching: RAW_KEY_STRETCHING,
 				}).registrationRecord
 			: undefined;
 	return { res, registrationRecord };
@@ -458,26 +572,35 @@ export async function rawResetPassword(device: Device, credential: ResetCredenti
 export async function startSetPassword(device: Device, newPassword: string) {
 	await ready;
 	const { clientRegistrationState, registrationRequest } = opaqueLib.startRegistration({ password: newPassword });
-	const res = await device.post<{ challenge: string }>("/opaque/setPassword/challenge", { registrationRequest });
+	const res = await device.post<{ challenge: string }>("/opaque/set-password/challenge", { registrationRequest });
 	const registrationRecord =
 		res.status === 200 && typeof res.body?.challenge === "string"
 			? opaqueLib.finishRegistration({
 					clientRegistrationState,
 					password: newPassword,
 					registrationResponse: res.body.challenge,
+					keyStretching: RAW_KEY_STRETCHING,
 				}).registrationRecord
 			: undefined;
 	return { res, registrationRecord };
 }
 
 /* -------------------------------------------------------------------------- */
-/*                         Plugin options (the contract)                      */
+/*                                 Type helpers                               */
 /* -------------------------------------------------------------------------- */
 
 export type Expect<T extends true> = T;
 export type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2 ? true : false;
 export type IsAny<T> = 0 extends 1 & T ? true : false;
 export type Extends<A, B> = [A] extends [B] ? true : false;
+
+export function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Outbox                                   */
+/* -------------------------------------------------------------------------- */
 
 export interface ResetLinkMail {
 	user: User;
@@ -497,48 +620,57 @@ export interface VerificationMail {
 	request?: Request;
 }
 
-/**
- * The server plugin options this suite is written against (the contract for
- * the implementation). `OPAQUE_SERVER_KEY` is always supplied by the harness.
- */
-export interface ContractPluginOptions {
-	insecureCreateSessionOnRegister?: boolean;
-	rateLimit?: { window?: number; max?: number };
-	/** Password reset by link. */
-	sendResetPassword?: (data: { user: User; url: string; token: string }, request?: Request) => Promise<void> | void;
-	/** Password reset by emailed one-time code. */
-	sendResetPasswordOTP?: (data: { user: User; otp: string }, request?: Request) => Promise<void> | void;
-	/** Link token lifetime in seconds. Default 3600. */
-	resetPasswordTokenExpiresIn?: number;
-	resetPasswordOTP?: {
-		/** Seconds. Default 300. */
-		expiresIn?: number;
-		/** Digits. Default 6. */
-		length?: number;
-		/** Default 3. */
-		allowedAttempts?: number;
-	};
-	/** Refuse OPAQUE login (403 EMAIL_NOT_VERIFIED) until the email is verified. Default false. */
-	requireEmailVerification?: boolean;
+/* -------------------------------------------------------------------------- */
+/*                                  Spies                                     */
+/* -------------------------------------------------------------------------- */
+
+/** One log line as it reached Better Auth's `logger.log`. */
+export interface LogEntry {
+	level: "debug" | "info" | "success" | "warn" | "error";
+	message: string;
+	args: unknown[];
 }
 
-type ServerPluginOptions = NonNullable<Parameters<typeof opaque>[0]>;
-type ContractOptionSupported = {
-	[K in keyof ContractPluginOptions]-?: K extends keyof ServerPluginOptions
-		? Extends<ContractPluginOptions[K], ServerPluginOptions[K]>
-		: false;
-};
-/**
- * Compile-time contract: every option above must exist on the real plugin
- * options with a compatible type. (Fails `tsc -p tests` until implemented.)
- */
-export type _PluginAcceptsContractOptions = Expect<
-	Equal<ContractOptionSupported[keyof ContractOptionSupported], true>
->;
+/** One call on the database adapter Better Auth uses (`ctx.adapter`). */
+export interface AdapterCall {
+	method: string;
+	model: string | undefined;
+}
+
+const ADAPTER_METHODS = new Set([
+	"create",
+	"findOne",
+	"findMany",
+	"count",
+	"update",
+	"updateMany",
+	"delete",
+	"deleteMany",
+	"consumeOne",
+	"incrementOne",
+]);
+
+/** Records every public adapter method call ({ method, model }) into `calls`. */
+function spyOnAdapter<A extends object>(adapter: A, calls: AdapterCall[]): A {
+	return new Proxy(adapter, {
+		get(target, key, receiver) {
+			const value = Reflect.get(target, key, receiver);
+			if (typeof key !== "string" || typeof value !== "function" || !ADAPTER_METHODS.has(key)) return value;
+			return (...args: any[]) => {
+				calls.push({ method: key, model: args[0]?.model });
+				return value.apply(target, args);
+			};
+		},
+	});
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               Harness options                              */
+/* -------------------------------------------------------------------------- */
 
 export interface HarnessOptions {
-	/** Extra plugin options (merged over the defaults below). */
-	plugin?: ContractPluginOptions;
+	/** Plugin options (the harness always supplies `OPAQUE_SERVER_KEY`). */
+	plugin?: Omit<OpaqueOptions, "OPAQUE_SERVER_KEY">;
 	/** Install a capturing `sendResetPassword` (link). */
 	resetLink?: boolean;
 	/** Install a capturing `sendResetPasswordOTP`. */
@@ -554,6 +686,12 @@ export interface HarnessOptions {
 	};
 	/** Enable core email + password (`/sign-up/email`, `/sign-in/email`). */
 	emailAndPassword?: boolean;
+	/**
+	 * Extra `betterAuth` options, applied over the harness defaults. `advanced`,
+	 * `session`, `rateLimit` and `logger` are merged one level deep; `plugins`
+	 * are appended after the OPAQUE plugin; everything else replaces.
+	 */
+	authOptions?: Partial<BetterAuthOptions>;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -578,7 +716,7 @@ export async function createTestHarness(options: HarnessOptions = {}) {
 			return outbox.verificationEmails.filter((m) => m.user.email.toLowerCase() === email.toLowerCase());
 		},
 	};
-	const pluginOptions: ContractPluginOptions & { OPAQUE_SERVER_KEY: string } = {
+	const pluginOptions: OpaqueOptions = {
 		...options.plugin,
 		OPAQUE_SERVER_KEY: serverSetup,
 	};
@@ -601,27 +739,42 @@ export async function createTestHarness(options: HarnessOptions = {}) {
 			}
 		: undefined;
 
+	// Every log line of this instance (info and above unless overridden), in
+	// order. Captured instead of printed.
+	const logs: LogEntry[] = [];
+	// Every public adapter call of this instance, in order.
+	const adapterCalls: AdapterCall[] = [];
+
 	// An explicit (per-harness) in-memory database. Without `database`, Better
 	// Auth 1.7 runs in *stateless* mode (JWE cookie cache valid for the whole
 	// session lifetime), which is not what a production deployment with a DB
 	// does and would make server-side revocation unobservable.
 	const memoryDB: Record<string, any[]> = {};
+	const baseAdapter = memoryAdapter(memoryDB);
+	const extra = options.authOptions ?? {};
 	const auth = betterAuth({
-		database: memoryAdapter(memoryDB),
+		database: ((dbOptions: BetterAuthOptions) =>
+			spyOnAdapter(baseAdapter(dbOptions), adapterCalls)) as unknown as BetterAuthOptions["database"],
 		baseURL: ORIGIN,
 		basePath: BASE_PATH,
 		secret: `test-secret-${randomBase64Url(32)}`,
 		trustedOrigins: [ORIGIN],
-		// Better Auth turns origin/CSRF checks off when NODE_ENV=test; turn them
-		// back on so the suite exercises production behaviour.
-		advanced: { disableOriginCheck: false, disableCSRFCheck: false },
-		rateLimit: { enabled: false },
-		session: { cookieCache: { enabled: true, maxAge: 300 } },
 		...(options.emailAndPassword ? { emailAndPassword: { enabled: true } } : {}),
 		...(emailVerification ? { emailVerification } : {}),
-		// The cast only bridges the contract options above to the current
-		// plugin signature; `_PluginAcceptsContractOptions` checks them.
-		plugins: [opaque(pluginOptions as Parameters<typeof opaque>[0])],
+		...extra,
+		// Better Auth turns origin/CSRF checks off when NODE_ENV=test; turn them
+		// back on so the suite exercises production behaviour.
+		advanced: { disableOriginCheck: false, disableCSRFCheck: false, ...extra.advanced },
+		rateLimit: { enabled: false, ...extra.rateLimit },
+		session: { cookieCache: { enabled: true, maxAge: 300 }, ...extra.session },
+		logger: {
+			level: "info",
+			log: (level, message, ...args) => {
+				logs.push({ level, message, args });
+			},
+			...extra.logger,
+		},
+		plugins: [opaque(pluginOptions), ...(extra.plugins ?? [])],
 	});
 	const ctx = await auth.$context;
 	// Create every table in the resolved schema (core + plugins), mirroring
@@ -678,6 +831,47 @@ export async function createTestHarness(options: HarnessOptions = {}) {
 			if (!user) throw new Error(`no user ${email}`);
 			await ctx.internalAdapter.updateUser(user.id, { emailVerified });
 		},
+		/**
+		 * Runs `fn` and counts how often each table of the in-memory database
+		 * is read by the adapter underneath Better Auth (one read per query
+		 * the adapter runs against that table, including the separate queries
+		 * Better Auth issues to emulate joins). Tables are instrumented only
+		 * for the duration of `fn`.
+		 */
+		async countTableReads(fn: () => Promise<unknown>): Promise<Record<string, number>> {
+			const counts: Record<string, number> = {};
+			const tables = Object.keys(memoryDB);
+			for (const table of tables) {
+				let rows = memoryDB[table];
+				counts[table] = 0;
+				Object.defineProperty(memoryDB, table, {
+					configurable: true,
+					enumerable: true,
+					get() {
+						counts[table]! += 1;
+						return rows;
+					},
+					set(value) {
+						rows = value;
+					},
+				});
+			}
+			try {
+				await fn();
+			} finally {
+				for (const table of tables) {
+					const descriptor = Object.getOwnPropertyDescriptor(memoryDB, table);
+					const rows = descriptor?.get ? descriptor.get.call(memoryDB) : memoryDB[table];
+					Object.defineProperty(memoryDB, table, {
+						configurable: true,
+						enumerable: true,
+						writable: true,
+						value: rows,
+					});
+				}
+			}
+			return counts;
+		},
 	};
 
 	return {
@@ -686,7 +880,17 @@ export async function createTestHarness(options: HarnessOptions = {}) {
 		db,
 		outbox,
 		serverSetup,
-		device: () => new Device(handler),
+		/** Captured log lines of this instance (see LogEntry). */
+		logs,
+		/** Captured public adapter calls of this instance (see AdapterCall). */
+		adapterCalls,
+		/** Adapter calls made while `fn` runs. */
+		async recordAdapterCalls(fn: () => Promise<unknown>): Promise<AdapterCall[]> {
+			const from = adapterCalls.length;
+			await fn();
+			return adapterCalls.slice(from);
+		},
+		device: (deviceOptions: DeviceOptions = {}) => new Device(handler, deviceOptions),
 		/** Register via the typed client on a throwaway device; asserts success. */
 		async register(email: string, password: string, name = "Test User") {
 			const d = new Device(handler);
@@ -697,8 +901,8 @@ export async function createTestHarness(options: HarnessOptions = {}) {
 			return res;
 		},
 		/** A new device logged in as `email`; throws if login fails. */
-		async loggedInDevice(email: string, password: string) {
-			const d = new Device(handler);
+		async loggedInDevice(email: string, password: string, deviceOptions: DeviceOptions = {}) {
+			const d = new Device(handler, deviceOptions);
 			const res = await d.client.signIn.opaque({ email, password });
 			if (res.error || !res.data) {
 				throw new Error(`login of ${email} failed: ${JSON.stringify(res.error)}`);

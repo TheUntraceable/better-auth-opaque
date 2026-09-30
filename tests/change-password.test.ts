@@ -7,11 +7,14 @@ import {
 	SESSION_DATA_COOKIE,
 	SESSION_TOKEN_COOKIE,
 	startChangePassword,
+	startLogin,
 	uniqueEmail,
 	validLoginPayload,
 } from "./helpers/harness";
 
 const h = await createTestHarness();
+/** Core email+password on: users WITHOUT an OPAQUE account. */
+const hCore = await createTestHarness({ emailAndPassword: true });
 await ready;
 
 const OLD_PASSWORD = "old password 1";
@@ -40,13 +43,13 @@ describe("change password: authentication", () => {
 		const login = opaqueLib.startLogin({ password: OLD_PASSWORD });
 		const reg = opaqueLib.startRegistration({ password: NEW_PASSWORD });
 
-		const challenge = await anon.post("/opaque/changePassword/challenge", {
+		const challenge = await anon.post("/opaque/change-password/challenge", {
 			loginRequest: login.startLoginRequest,
 			registrationRequest: reg.registrationRequest,
 		});
 		expect(challenge.status).toBe(401);
 
-		const complete = await anon.post("/opaque/changePassword/complete", {
+		const complete = await anon.post("/opaque/change-password/complete", {
 			loginResult: randomBase64Url(64),
 			registrationRecord: randomBase64Url(192),
 			encryptedServerState: "x",
@@ -58,6 +61,35 @@ describe("change password: authentication", () => {
 		const res = await h.device().client.opaque.changePassword({ currentPassword: OLD_PASSWORD, newPassword: NEW_PASSWORD });
 		expect(res.data).toBeNull();
 		expect(res.error).toMatchObject({ status: 401 });
+	});
+});
+
+describe("change password: user without an OPAQUE account", () => {
+	test("the CHALLENGE is 400 OPAQUE_ACCOUNT_NOT_FOUND (authenticated caller: nothing to hide)", async () => {
+		const email = uniqueEmail("chpw-noopaque");
+		const device = await hCore.coreSignUp(email);
+		const login = opaqueLib.startLogin({ password: "core-password-123" });
+		const reg = opaqueLib.startRegistration({ password: NEW_PASSWORD });
+
+		const res = await device.post("/opaque/change-password/challenge", {
+			loginRequest: login.startLoginRequest,
+			registrationRequest: reg.registrationRequest,
+		});
+
+		expect({ status: res.status, code: res.body?.code }).toEqual({ status: 400, code: "OPAQUE_ACCOUNT_NOT_FOUND" });
+		expect(await hCore.db.opaqueAccounts(email)).toHaveLength(0);
+	});
+
+	test("client.opaque.changePassword surfaces { status: 400, code: OPAQUE_ACCOUNT_NOT_FOUND }; nothing changes", async () => {
+		const email = uniqueEmail("chpw-noopaque-client");
+		const device = await hCore.coreSignUp(email);
+
+		const res = await device.client.opaque.changePassword({ currentPassword: "core-password-123", newPassword: NEW_PASSWORD });
+
+		expect(res.data).toBeNull();
+		expect(res.error).toMatchObject({ status: 400, code: "OPAQUE_ACCOUNT_NOT_FOUND" });
+		expect(await hCore.db.opaqueAccounts(email)).toHaveLength(0);
+		expect((await hCore.device().post("/sign-in/email", { email, password: "core-password-123" })).status).toBe(200);
 	});
 });
 
@@ -85,7 +117,7 @@ describe("change password: wrong current password", () => {
 
 		const started = await startChangePassword(device, "not the password", NEW_PASSWORD);
 		expect(started.loginResult).toBeUndefined(); // client can't prove a wrong password
-		const res = await device.post("/opaque/changePassword/complete", {
+		const res = await device.post("/opaque/change-password/complete", {
 			loginResult: randomBase64Url(64),
 			registrationRecord: started.registrationRecord,
 			encryptedServerState: started.encryptedServerState,
@@ -104,7 +136,7 @@ describe("change password: wrong current password", () => {
 		const recordBefore = await h.db.registrationRecord(email);
 
 		const started = await startChangePassword(device, OLD_PASSWORD, NEW_PASSWORD);
-		const res = await device.post("/opaque/changePassword/complete", {
+		const res = await device.post("/opaque/change-password/complete", {
 			loginResult: "AAAA",
 			registrationRecord: started.registrationRecord,
 			encryptedServerState: started.encryptedServerState,
@@ -177,7 +209,7 @@ describe("change password: state integrity", () => {
 		// Victim's (fully valid) challenge material, submitted from the attacker's session.
 		const stolen = await startChangePassword(victim.devices[0]!, OLD_PASSWORD, "attacker chosen");
 		expect(stolen.loginResult).toBeDefined();
-		const res = await attacker.devices[0]!.post("/opaque/changePassword/complete", {
+		const res = await attacker.devices[0]!.post("/opaque/change-password/complete", {
 			loginResult: stolen.loginResult,
 			registrationRecord: stolen.registrationRecord,
 			encryptedServerState: stolen.encryptedServerState,
@@ -198,7 +230,7 @@ describe("change password: state integrity", () => {
 			registrationRecord: started.registrationRecord,
 			encryptedServerState: started.encryptedServerState,
 		};
-		const first = await device.post("/opaque/changePassword/complete", payload);
+		const first = await device.post("/opaque/change-password/complete", payload);
 		expect(first.status).toBe(200);
 		const recordAfterFirst = await h.db.registrationRecord(email);
 
@@ -206,9 +238,48 @@ describe("change password: state integrity", () => {
 		// comes from replay protection, not from a missing session.
 		expect((await device.whoami({ tokenOnly: true })).session?.user.email).toBe(email);
 
-		const replay = await device.post("/opaque/changePassword/complete", payload);
+		const replay = await device.post("/opaque/change-password/complete", payload);
 		expect(isClientError(replay.status)).toBe(true);
 		expect(await h.db.registrationRecord(email)).toBe(recordAfterFirst);
+	});
+});
+
+describe("change password: login and change-password states are not interchangeable", () => {
+	test("a sign-in state submitted to change-password complete is 400 INVALID_LOGIN_STATE; nothing changes", async () => {
+		const { email, devices } = await userWithDevices(1);
+		const device = devices[0]!;
+		const recordBefore = await h.db.registrationRecord(email);
+		const signIn = await startLogin(h.device(), email, OLD_PASSWORD);
+		const loginResult = signIn.finish();
+		expect(loginResult).toBeDefined();
+		const { registrationRecord } = await startChangePassword(device, OLD_PASSWORD, NEW_PASSWORD);
+
+		const res = await device.post("/opaque/change-password/complete", {
+			loginResult,
+			registrationRecord,
+			encryptedServerState: signIn.state,
+		});
+
+		expect({ status: res.status, code: res.body?.code }).toEqual({ status: 400, code: "INVALID_LOGIN_STATE" });
+		expect(await h.db.registrationRecord(email)).toBe(recordBefore);
+	});
+
+	test("a change-password state submitted to sign-in complete is 400 INVALID_LOGIN_STATE; no session", async () => {
+		const { email, devices } = await userWithDevices(1);
+		const started = await startChangePassword(devices[0]!, OLD_PASSWORD, NEW_PASSWORD);
+		expect(started.loginResult).toBeDefined();
+		const sessionsBefore = await h.db.sessionCount();
+		const attacker = h.device();
+
+		const res = await attacker.post("/sign-in/opaque/complete", {
+			email,
+			loginResult: started.loginResult,
+			encryptedServerState: started.encryptedServerState,
+		});
+
+		expect({ status: res.status, code: res.body?.code }).toEqual({ status: 400, code: "INVALID_LOGIN_STATE" });
+		expect(await h.db.sessionCount()).toBe(sessionsBefore);
+		expect(attacker.jar.has(SESSION_TOKEN_COOKIE)).toBe(false);
 	});
 });
 
@@ -216,7 +287,7 @@ describe("change password: state integrity", () => {
 async function rawChangePassword(device: Device, extra: { revokeOtherSessions?: boolean } = {}) {
 	const started = await startChangePassword(device, OLD_PASSWORD, NEW_PASSWORD);
 	expect(started.loginResult).toBeDefined();
-	const res = await device.post("/opaque/changePassword/complete", {
+	const res = await device.post("/opaque/change-password/complete", {
 		loginResult: started.loginResult,
 		registrationRecord: started.registrationRecord,
 		encryptedServerState: started.encryptedServerState,

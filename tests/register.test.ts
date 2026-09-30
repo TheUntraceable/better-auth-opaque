@@ -9,18 +9,15 @@ import {
 } from "./helpers/harness";
 
 const h = await createTestHarness();
+/** insecureCreateSessionOnRegister: a session is created on registration. */
+const hAutoSession = await createTestHarness({ plugin: { insecureCreateSessionOnRegister: true } });
+/** A required, client-settable additional user field. */
+const hFields = await createTestHarness({
+	authOptions: { user: { additionalFields: { plan: { type: "string", required: true, input: true } } } },
+});
 await ready;
 
 const REGISTER_OK = { success: true, message: "User registered successfully" };
-
-/**
- * `client.signUp.opaque` returns `{ error }` without a `data` key when the
- * challenge step fails (unlike signIn, which returns `data: null`); normalise
- * so the assertion is identical either way.
- */
-function dataOf(res: object): unknown {
-	return "data" in res ? (res.data ?? null) : null;
-}
 
 describe("register", () => {
 	test("happy path: client returns the success body and the account is stored without creating a session", async () => {
@@ -31,7 +28,7 @@ describe("register", () => {
 		const res = await device.client.signUp.opaque({ email, password: "pw-reg-1", name: "Reg User" });
 
 		expect(res.error).toBeNull();
-		expect(dataOf(res)).toEqual(REGISTER_OK);
+		expect(res.data).toEqual(REGISTER_OK);
 
 		const user = await h.db.user(email);
 		expect(user).not.toBeNull();
@@ -102,7 +99,7 @@ describe("register", () => {
 			password: "pw",
 			name: "Bad Email",
 		});
-		expect(dataOf(viaClient)).toBeNull();
+		expect(viaClient.data).toBeNull();
 		expect(viaClient.error).toMatchObject({ status: 400 });
 
 		const { registrationRequest } = opaqueLib.startRegistration({ password: "pw" });
@@ -157,7 +154,7 @@ describe("register", () => {
 			password: "pw-longname",
 			name: "x".repeat(101),
 		});
-		expect(dataOf(res)).toBeNull();
+		expect(res.data).toBeNull();
 		expect(res.error).toMatchObject({ status: 400 });
 		expect(await h.db.user(email)).toBeNull();
 	});
@@ -165,7 +162,7 @@ describe("register", () => {
 	test("empty name is rejected with 400 and creates no user", async () => {
 		const email = uniqueEmail("noname");
 		const res = await h.device().client.signUp.opaque({ email, password: "pw-noname", name: "" });
-		expect(dataOf(res)).toBeNull();
+		expect(res.data).toBeNull();
 		expect(res.error).toMatchObject({ status: 400 });
 		expect(await h.db.user(email)).toBeNull();
 	});
@@ -184,5 +181,64 @@ describe("register", () => {
 			expect({ variant, error: login.error }).toEqual({ variant, error: null });
 			expect(login.data?.user.id).toBe(user!.id);
 		}
+	});
+});
+
+describe("register: insecureCreateSessionOnRegister", () => {
+	test("a new user is signed in: session cookie set, session in the database", async () => {
+		const email = uniqueEmail("reg-auto");
+		const device = hAutoSession.device();
+
+		const res = await device.client.signUp.opaque({ email, password: "pw-auto", name: "Auto" });
+
+		expect(res.error).toBeNull();
+		expect(device.jar.has(SESSION_TOKEN_COOKIE)).toBe(true);
+		expect(await hAutoSession.db.sessionsFor(email)).toHaveLength(1);
+		expect((await device.whoami({ tokenOnly: true })).session?.user.email).toBe(email);
+	});
+
+	test("a duplicate registration signs nobody in", async () => {
+		const email = uniqueEmail("reg-auto-dup");
+		await hAutoSession.register(email, "pw-auto");
+		const sessionsBefore = await hAutoSession.db.sessionCount();
+
+		const dup = await rawRegister(hAutoSession.device(), email, "attacker password");
+
+		expect(dup.complete.status).toBe(201);
+		expect(dup.complete.setCookies.map((c) => c.name)).not.toContain(SESSION_TOKEN_COOKIE);
+		expect(await hAutoSession.db.sessionCount()).toBe(sessionsBefore);
+	});
+});
+
+describe("register: user.additionalFields", () => {
+	test("raw: an input field sent to the complete step is stored on the new user", async () => {
+		const email = uniqueEmail("reg-fields");
+		const { complete } = await rawRegister(hFields.device(), email, "pw-fields", "Fields", { plan: "pro" });
+
+		expect(complete.status).toBe(201);
+		expect(((await hFields.db.user(email)) as { plan?: unknown } | null)?.plan).toBe("pro");
+	});
+
+	test("raw: a missing required field is 400 MISSING_FIELD (as core's /sign-up/email) and creates no user", async () => {
+		const email = uniqueEmail("reg-fields-missing");
+		const { complete } = await rawRegister(hFields.device(), email, "pw-fields");
+
+		expect({ status: complete.status, code: complete.body?.code }).toEqual({ status: 400, code: "MISSING_FIELD" });
+		expect(await hFields.db.user(email)).toBeNull();
+		// Same as core:
+		const core = await hFields.device().post("/sign-up/email", { email, password: "core-password-1", name: "Core" });
+		expect({ status: core.status, code: core.body?.code }).toEqual({ status: 400, code: "MISSING_FIELD" });
+	});
+
+	test("client: signUp.opaque passes additional fields through to the complete step", async () => {
+		const email = uniqueEmail("reg-fields-client");
+		const device = hFields.device();
+		const input = { email, name: "Fields", password: "pw-fields", plan: "pro" };
+
+		const res = await device.client.signUp.opaque(input as Parameters<typeof device.client.signUp.opaque>[0]);
+
+		expect(res.error).toBeNull();
+		expect(device.requestsTo("/sign-up/opaque/complete").at(-1)!.body.plan).toBe("pro");
+		expect(((await hFields.db.user(email)) as { plan?: unknown } | null)?.plan).toBe("pro");
 	});
 });

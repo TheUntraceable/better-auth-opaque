@@ -1,5 +1,5 @@
 {
-	// Type-checks the test suite (the root tsconfig only covers src/ for the build).
+	// Type-checks the test suite and examples/ (the root tsconfig only covers src/ for the build).
 	"extends": "../tsconfig.json",
 	"compilerOptions": {
 		"noEmit": true,
@@ -8,6 +8,6 @@
 		"declarationMap": false,
 		"sourceMap": false
 	},
-	"include": ["./**/*.ts", "../src/**/*.ts"],
+	"include": ["./**/*.ts", "../src/**/*.ts", "../examples/**/*.ts"],
 	"exclude": []
 }

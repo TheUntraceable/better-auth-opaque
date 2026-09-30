@@ -120,13 +120,16 @@ describe("concurrency / cross-user isolation", () => {
 		const d = h.device();
 		const res = await d.post("/sign-in/opaque/complete", { ...payload, email: b });
 
+		// The user comes from the server state, never from the body: it is a
+		// normal login as A.
+		expect(res.status).toBe(200);
+		expect(res.body.user.id).toBe((await h.db.user(a))!.id);
 		const [aAfter, bAfter] = await sessionCounts(a, b);
 		expect(bAfter).toBe(bBefore);
-		// Any session that was created belongs to A.
-		expect((await h.db.sessionCount()) - totalBefore).toBe(aAfter - aBefore);
+		expect(aAfter).toBe(aBefore + 1);
+		expect((await h.db.sessionCount()) - totalBefore).toBe(1);
 		const who = await d.whoami({ tokenOnly: true });
-		expect(who.session?.user.email ?? null).not.toBe(b);
-		if (res.ok) expect(res.body.user.id).toBe((await h.db.user(a))!.id);
+		expect(who.session?.user.email).toBe(a);
 	});
 
 	test("many users logging in concurrently each get their own session", async () => {

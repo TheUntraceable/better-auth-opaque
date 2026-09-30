@@ -1,6 +1,6 @@
 /**
  * Forgot / reset password, by emailed link (token) or emailed one-time code
- * (OTP). Contract: see ContractPluginOptions in helpers/harness.ts.
+ * (OTP).
  *
  * Endpoints:
  *   POST /opaque/forget-password         { email, method?: "link" | "otp", redirectTo? }
@@ -503,6 +503,30 @@ describe("reset link: GET of the emailed url (mirrors core GET /reset-password/:
 		expect(res.status).toBe(302);
 		expect(res.headers.get("location")).toBe(`${ORIGIN}/reset?error=INVALID_TOKEN`);
 	});
+
+	test("an expired token redirects to callbackURL with ?error=INVALID_TOKEN", async () => {
+		const { email } = await opaqueUser(hLinkShort, "rp-get-expired");
+		const { mail } = await requestLink(hLinkShort, email, "/reset");
+		setSystemTime(new Date(Date.now() + 2_000));
+
+		const res = await hLinkShort.device().request(mail.url.slice(`${ORIGIN}${BASE_PATH}`.length), { method: "GET" });
+
+		expect(res.status).toBe(302);
+		expect(res.headers.get("location")).toBe(`${ORIGIN}/reset?error=INVALID_TOKEN`);
+	});
+
+	test("an untrusted callbackURL is 403 and does not redirect", async () => {
+		const { email } = await opaqueUser(hLink, "rp-get-evil");
+		const { mail } = await requestLink(hLink, email);
+
+		const res = await hLink.device().request(
+			`/opaque/reset-password/${mail.token}?callbackURL=${encodeURIComponent("https://evil.example/steal")}`,
+			{ method: "GET" },
+		);
+
+		expect(res.status).toBe(403);
+		expect(res.headers.get("location")).toBeNull();
+	});
 });
 
 /* ------------------------------ forget: OTP ------------------------------- */
@@ -535,14 +559,13 @@ describe("forget password: OTP", () => {
 	});
 
 	test("the OTP is not stored in plaintext in the verification table", async () => {
-		const { email } = await opaqueUser(hOTP, "fp-otp-hashed");
-		const { otp } = await requestOTP(hOTP, email);
-		const rows = hOTP.db.verificationRows();
+		// 8-digit codes (hOTPCustom): a chance occurrence of the code inside
+		// random ids / hashes is negligible, so any hit means plaintext.
+		const { email } = await opaqueUser(hOTPCustom, "fp-otp-hashed");
+		const { otp } = await requestOTP(hOTPCustom, email);
+		const rows = hOTPCustom.db.verificationRows();
 		expect(rows.length).toBeGreaterThan(0);
-		for (const row of rows) {
-			const parts = `${row.identifier}:${String(row.value)}`.split(/[:\-_.@]/);
-			expect(parts).not.toContain(otp);
-		}
+		expect(JSON.stringify(rows)).not.toContain(otp);
 	});
 
 	test("a second request replaces the first code (one live code per email)", async () => {
@@ -616,7 +639,7 @@ describe("reset with OTP", () => {
 		expect(await hOTP.db.registrationRecord(email)).toBe(recordBefore);
 	});
 
-	test("after allowedAttempts (default 3) wrong completes, the CORRECT code is 400 TOO_MANY_ATTEMPTS; a new request issues a working code", async () => {
+	test("after allowedAttempts (default 3) wrong completes, the CORRECT code is 400 INVALID_TOKEN (the code is dead); a new request issues a working code", async () => {
 		const { email } = await opaqueUser(hOTP, "rp-otp-lock");
 		const recordBefore = await hOTP.db.registrationRecord(email);
 		const { otp } = await requestOTP(hOTP, email);
@@ -626,12 +649,10 @@ describe("reset with OTP", () => {
 		for (let i = 0; i < 3; i++) {
 			expectCode(await complete(hOTP, { email, otp: wrong }, registrationRecord!), 400, "INVALID_TOKEN");
 		}
-		expectCode(await complete(hOTP, { email, otp }, registrationRecord!), 400, "TOO_MANY_ATTEMPTS");
+		expectCode(await complete(hOTP, { email, otp }, registrationRecord!), 400, "INVALID_TOKEN");
 		expect(await hOTP.db.registrationRecord(email)).toBe(recordBefore);
-		// Still locked on any later try.
-		const again = await challenge(hOTP, { email, otp });
-		expect(again.status).toBe(400);
-		expect(["TOO_MANY_ATTEMPTS", "INVALID_TOKEN"]).toContain(again.body?.code);
+		// Still dead on any later try.
+		expectCode(await challenge(hOTP, { email, otp }), 400, "INVALID_TOKEN");
 
 		const fresh = await requestOTP(hOTP, email);
 		const ok = await rawResetPassword(hOTP.device(), { email, otp: fresh.otp }, NEW_PASSWORD);
@@ -645,7 +666,7 @@ describe("reset with OTP", () => {
 		const wrong = otp === "000000" ? "111111" : "000000";
 
 		for (let i = 0; i < 3; i++) expectCode(await challenge(hOTP, { email, otp: wrong }), 400, "INVALID_TOKEN");
-		expectCode(await challenge(hOTP, { email, otp }), 400, "TOO_MANY_ATTEMPTS");
+		expectCode(await challenge(hOTP, { email, otp }), 400, "INVALID_TOKEN");
 	});
 
 	test("resetPasswordOTP.allowedAttempts is honoured (1 → one wrong try locks the code)", async () => {
@@ -653,7 +674,30 @@ describe("reset with OTP", () => {
 		const { otp } = await requestOTP(hOTPCustom, email);
 		const wrong = otp === "00000000" ? "11111111" : "00000000";
 		expectCode(await challenge(hOTPCustom, { email, otp: wrong }), 400, "INVALID_TOKEN");
-		expectCode(await challenge(hOTPCustom, { email, otp }), 400, "TOO_MANY_ATTEMPTS");
+		expectCode(await challenge(hOTPCustom, { email, otp }), 400, "INVALID_TOKEN");
+	});
+
+	test("lockout does not enumerate: forget + 4 wrong guesses give IDENTICAL responses (status and body) for a known and an unknown email", async () => {
+		const { email } = await opaqueUser(hOTP, "rp-otp-enum-known");
+		const ghost = uniqueEmail("rp-otp-enum-ghost");
+
+		const knownForgot = await forget(hOTP, { email });
+		const realOtp = hOTP.outbox.resetOTPsFor(email).at(-1)!.otp;
+		const guesses = ["000000", "111111", "222222", "333333", "444444"].filter((g) => g !== realOtp).slice(0, 4);
+
+		async function transcript(target: string, forgot: { status: number; body: unknown }) {
+			const out = [{ status: forgot.status, body: forgot.body }];
+			for (const otp of guesses) {
+				const res = await challenge(hOTP, { email: target, otp });
+				out.push({ status: res.status, body: res.body });
+			}
+			return out;
+		}
+
+		const known = await transcript(email, knownForgot);
+		const unknown = await transcript(ghost, await forget(hOTP, { email: ghost }));
+
+		expect(unknown).toEqual(known);
 	});
 
 	test("expired code (default 300s): challenge and complete are 400 INVALID_TOKEN", async () => {

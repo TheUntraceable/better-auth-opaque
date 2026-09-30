@@ -33,7 +33,7 @@ const FLAGS = { sendOnSignUp: true, sendOnSignIn: true, autoSignInAfterVerificat
 /** requireEmailVerification: true, send on sign-up and sign-in. */
 const hReq = await createTestHarness({
 	verification: FLAGS,
-	plugin: { requireEmailVerification: true },
+	plugin: { requireEmailVerification: true, setPassword: { enabled: true } },
 	resetLink: true,
 	emailAndPassword: true,
 });
@@ -46,6 +46,11 @@ const hQuiet = await createTestHarness({
 });
 /** requireEmailVerification: true, sendOnSignUp unset (core falls back to requireEmailVerification). */
 const hImplicit = await createTestHarness({ verification: {}, plugin: { requireEmailVerification: true } });
+/** insecureCreateSessionOnRegister, but verification is required. */
+const hAutoReq = await createTestHarness({
+	verification: FLAGS,
+	plugin: { requireEmailVerification: true, insecureCreateSessionOnRegister: true },
+});
 
 const PASSWORD = "verify me password";
 
@@ -121,6 +126,57 @@ describe("email verification: on sign-up", () => {
 
 	test("sendOnSignUp unset falls back to requireEmailVerification (true → sent)", async () => {
 		await registerExpectingMail(hImplicit, "ev-implicit");
+	});
+});
+
+describe("email verification: callbackURL via the client", () => {
+	test("signUp.opaque({ callbackURL }) sends it to the complete step and the verification link carries it", async () => {
+		const email = uniqueEmail("ev-cb-signup");
+		const device = hReq.device();
+		const callbackURL = "/welcome?from=signup";
+
+		const res = await device.client.signUp.opaque({ email, name: "Callback", password: PASSWORD, callbackURL });
+
+		expect(res.error).toBeNull();
+		expect(device.requestsTo("/sign-up/opaque/complete").at(-1)!.body.callbackURL).toBe(callbackURL);
+		const mail = hReq.outbox.verificationEmailsFor(email).at(-1);
+		expect(mail).toBeDefined();
+		expect(new URL(mail!.url).searchParams.get("callbackURL")).toBe(callbackURL);
+	});
+
+	test("signIn.opaque({ callbackURL }) sends it to the complete step and the re-sent verification link carries it", async () => {
+		const { email } = await registerUser(hReq, "ev-cb-signin");
+		const device = hReq.device();
+		const callbackURL = "/welcome?from=signin";
+		const before = mails(hReq, email);
+
+		const res = await device.client.signIn.opaque({ email, password: PASSWORD, callbackURL });
+
+		expect(res.error).toMatchObject({ status: 403, code: "EMAIL_NOT_VERIFIED" });
+		expect(device.requestsTo("/sign-in/opaque/complete").at(-1)!.body.callbackURL).toBe(callbackURL);
+		expect(mails(hReq, email)).toBe(before + 1);
+		const mail = hReq.outbox.verificationEmailsFor(email).at(-1)!;
+		expect(new URL(mail.url).searchParams.get("callbackURL")).toBe(callbackURL);
+	});
+
+	test("without callbackURL the link's callbackURL is '/'", async () => {
+		const { mail } = await registerExpectingMail(hReq, "ev-cb-default");
+		expect(new URL(mail.url).searchParams.get("callbackURL")).toBe("/");
+	});
+});
+
+describe("email verification: insecureCreateSessionOnRegister", () => {
+	test("does not sign in a new user while verification is required", async () => {
+		const email = uniqueEmail("ev-autosession");
+		const device = hAutoReq.device();
+		const sessionsBefore = await hAutoReq.db.sessionCount();
+
+		const res = await device.client.signUp.opaque({ email, name: "Auto", password: PASSWORD });
+
+		expect(res.error).toBeNull();
+		expect(device.jar.has(SESSION_TOKEN_COOKIE)).toBe(false);
+		expect(await hAutoReq.db.sessionCount()).toBe(sessionsBefore);
+		expect(hAutoReq.outbox.verificationEmailsFor(email)).toHaveLength(1);
 	});
 });
 
@@ -222,7 +278,7 @@ describe("email verification: other flows are unaffected by verification state",
 		const before = mails(hReq, email);
 
 		const started = await startChangePassword(device, PASSWORD, "changed password");
-		const res = await device.post("/opaque/changePassword/complete", {
+		const res = await device.post("/opaque/change-password/complete", {
 			loginResult: started.loginResult,
 			registrationRecord: started.registrationRecord,
 			encryptedServerState: started.encryptedServerState,
@@ -239,7 +295,7 @@ describe("email verification: other flows are unaffected by verification state",
 
 		const started = await startSetPassword(device, "set password");
 		expect(started.res.status).toBe(200);
-		const res = await device.post("/opaque/setPassword/complete", { registrationRecord: started.registrationRecord });
+		const res = await device.post("/opaque/set-password/complete", { registrationRecord: started.registrationRecord });
 		expect(res.status).toBe(200);
 		expect(await hReq.db.opaqueAccounts(email)).toHaveLength(1);
 	});

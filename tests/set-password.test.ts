@@ -2,14 +2,17 @@
  * Set an OPAQUE password for a logged-in user who has no OPAQUE account yet
  * (e.g. signed up with core email+password or a social provider).
  *
- *   POST /opaque/setPassword/challenge { registrationRequest }  (session required)
- *   POST /opaque/setPassword/complete  { registrationRecord }   (session required)
+ *   POST /opaque/set-password/challenge { registrationRequest }  (fresh session required)
+ *   POST /opaque/set-password/complete  { registrationRecord }   (fresh session required)
+ *
+ * Opt-in: `setPassword: { enabled: true }` (default false).
  */
 import { client as opaqueLib, ready } from "@serenity-kit/opaque";
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import {
 	createTestHarness,
 	type Device,
+	FAST_KEY_STRETCHING,
 	randomBase64Url,
 	SESSION_TOKEN_COOKIE,
 	startSetPassword,
@@ -19,7 +22,19 @@ import {
 
 await ready;
 
-const h = await createTestHarness({ emailAndPassword: true });
+const h = await createTestHarness({ emailAndPassword: true, plugin: { setPassword: { enabled: true } } });
+/** Default options: set-password is NOT enabled. */
+const hOff = await createTestHarness({ emailAndPassword: true });
+/** Enabled, with sessions that stop being fresh after 60s. */
+const hStale = await createTestHarness({
+	emailAndPassword: true,
+	plugin: { setPassword: { enabled: true } },
+	authOptions: { session: { freshAge: 60 } },
+});
+
+afterEach(() => {
+	setSystemTime(); // never leak a mocked clock into other tests
+});
 
 const CORE_PASSWORD = "core-password-123";
 const OPAQUE_PASSWORD = "new opaque password";
@@ -47,11 +62,69 @@ async function rawSetPassword(device: Device, password = OPAQUE_PASSWORD) {
 	if (!started.registrationRecord) {
 		throw new Error(`set-password challenge failed: ${started.res.status} ${started.res.text}`);
 	}
-	const complete = await device.post("/opaque/setPassword/complete", {
+	const complete = await device.post("/opaque/set-password/complete", {
 		registrationRecord: started.registrationRecord,
 	});
 	return { challenge: started.res, complete, registrationRecord: started.registrationRecord };
 }
+
+/** A storable registration record (from a side-effect-free sign-up challenge). */
+async function someRegistrationRecord(email: string, password = OPAQUE_PASSWORD) {
+	const { clientRegistrationState, registrationRequest } = opaqueLib.startRegistration({ password });
+	const ch = await h.device().post("/sign-up/opaque/challenge", { email, registrationRequest });
+	expect(ch.status).toBe(200);
+	return opaqueLib.finishRegistration({
+		clientRegistrationState,
+		password,
+		registrationResponse: ch.body.challenge,
+		keyStretching: FAST_KEY_STRETCHING, // only stored, never logged in with
+	}).registrationRecord;
+}
+
+describe("set password: opt-in (setPassword.enabled, default false)", () => {
+	test("default options: challenge and complete are 404 for an authenticated, fresh session (old and new paths); nothing is created", async () => {
+		const email = uniqueEmail("setpw-off");
+		const device = await hOff.coreSignUp(email, CORE_PASSWORD);
+		expect((await device.whoami({ tokenOnly: true })).session?.user.email).toBe(email);
+		const { registrationRequest } = opaqueLib.startRegistration({ password: OPAQUE_PASSWORD });
+		const registrationRecord = await someRegistrationRecord(email);
+
+		for (const base of ["/opaque/set-password", "/opaque/setPassword"]) {
+			const challenge = await device.post(`${base}/challenge`, { registrationRequest });
+			const complete = await device.post(`${base}/complete`, { registrationRecord });
+			expect({ base, challenge: challenge.status, complete: complete.status }).toEqual({
+				base,
+				challenge: 404,
+				complete: 404,
+			});
+		}
+		expect(await hOff.db.opaqueAccounts(email)).toHaveLength(0);
+	});
+
+	test("default options: client.opaque.setPassword returns { data: null, error.status 404 }", async () => {
+		const email = uniqueEmail("setpw-off-client");
+		const device = await hOff.coreSignUp(email, CORE_PASSWORD);
+		const res = await device.client.opaque.setPassword({ newPassword: OPAQUE_PASSWORD });
+		expect(res.data).toBeNull();
+		expect(res.error).toMatchObject({ status: 404 });
+		expect(await hOff.db.opaqueAccounts(email)).toHaveLength(0);
+	});
+
+	test("enabled, but the session is no longer fresh (session.freshAge): 403 on both steps, nothing is created", async () => {
+		const email = uniqueEmail("setpw-stale");
+		const device = await hStale.coreSignUp(email, CORE_PASSWORD);
+		const fresh = await startSetPassword(device, OPAQUE_PASSWORD);
+		expect(fresh.res.status).toBe(200);
+
+		setSystemTime(new Date(Date.now() + 120_000));
+
+		const { registrationRequest } = opaqueLib.startRegistration({ password: OPAQUE_PASSWORD });
+		expect((await device.post("/opaque/set-password/challenge", { registrationRequest })).status).toBe(403);
+		const complete = await device.post("/opaque/set-password/complete", { registrationRecord: fresh.registrationRecord });
+		expect(complete.status).toBe(403);
+		expect(await hStale.db.opaqueAccounts(email)).toHaveLength(0);
+	});
+});
 
 describe("set password: preconditions", () => {
 	test("the fixture user really has no OPAQUE account and is logged in", async () => {
@@ -65,9 +138,9 @@ describe("set password: authentication", () => {
 	test("unauthenticated challenge and complete are 401", async () => {
 		const anon = h.device();
 		const { registrationRequest } = opaqueLib.startRegistration({ password: OPAQUE_PASSWORD });
-		expect((await anon.post("/opaque/setPassword/challenge", { registrationRequest })).status).toBe(401);
+		expect((await anon.post("/opaque/set-password/challenge", { registrationRequest })).status).toBe(401);
 		expect(
-			(await anon.post("/opaque/setPassword/complete", { registrationRecord: UNDESERIALISABLE_RECORD })).status,
+			(await anon.post("/opaque/set-password/complete", { registrationRecord: UNDESERIALISABLE_RECORD })).status,
 		).toBe(401);
 	});
 
@@ -77,7 +150,7 @@ describe("set password: authentication", () => {
 		expect((await device.whoami()).session?.user.email).toBe(email); // cookie cache still says yes
 
 		const { registrationRequest } = opaqueLib.startRegistration({ password: OPAQUE_PASSWORD });
-		expect((await device.post("/opaque/setPassword/challenge", { registrationRequest })).status).toBe(401);
+		expect((await device.post("/opaque/set-password/challenge", { registrationRequest })).status).toBe(401);
 		expect(await h.db.opaqueAccounts(email)).toHaveLength(0);
 	});
 });
@@ -92,7 +165,7 @@ describe("set password: challenge", () => {
 
 	test("registrationRequest of the wrong length: 400 INVALID_REGISTRATION_REQUEST", async () => {
 		const { device } = await coreUser();
-		const res = await device.post("/opaque/setPassword/challenge", { registrationRequest: randomBase64Url(16) });
+		const res = await device.post("/opaque/set-password/challenge", { registrationRequest: randomBase64Url(16) });
 		expectCode(res, 400, "INVALID_REGISTRATION_REQUEST");
 	});
 
@@ -149,7 +222,7 @@ describe("set password: complete", () => {
 		const first = await rawSetPassword(device);
 		expect(first.complete.status).toBe(200);
 
-		const second = await device.post("/opaque/setPassword/complete", { registrationRecord: first.registrationRecord });
+		const second = await device.post("/opaque/set-password/complete", { registrationRecord: first.registrationRecord });
 		expectCode(second, 400, "OPAQUE_ACCOUNT_ALREADY_EXISTS");
 		expect(await h.db.opaqueAccounts(email)).toHaveLength(1);
 		expect(await h.db.registrationRecord(email)).toBe(first.registrationRecord);
@@ -170,7 +243,7 @@ describe("set password: complete", () => {
 			registrationResponse: ch.body.challenge,
 		});
 
-		const res = await device.post("/opaque/setPassword/complete", { registrationRecord });
+		const res = await device.post("/opaque/set-password/complete", { registrationRecord });
 		expectCode(res, 400, "OPAQUE_ACCOUNT_ALREADY_EXISTS");
 		expect(await h.db.registrationRecord(email)).toBe(recordBefore);
 		expect(await canLogIn(email, "existing opaque password")).toBe(true);
@@ -181,7 +254,7 @@ describe("set password: complete", () => {
 		["too short (100 bytes)", randomBase64Url(100)],
 	])("%s registrationRecord: 400 INVALID_REGISTRATION_RECORD and no account is created", async (_label, bad) => {
 		const { email, device } = await coreUser("setpw-badrec");
-		const res = await device.post("/opaque/setPassword/complete", { registrationRecord: bad });
+		const res = await device.post("/opaque/set-password/complete", { registrationRecord: bad });
 		expectCode(res, 400, "INVALID_REGISTRATION_RECORD");
 		expect(await h.db.opaqueAccounts(email)).toHaveLength(0);
 
@@ -199,17 +272,52 @@ describe("set password: complete", () => {
 		expect(b.res.status).toBe(200);
 
 		const [resA, resB] = await Promise.all([
-			device.post("/opaque/setPassword/complete", { registrationRecord: a.registrationRecord }),
-			device.post("/opaque/setPassword/complete", { registrationRecord: b.registrationRecord }),
+			device.post("/opaque/set-password/complete", { registrationRecord: a.registrationRecord }),
+			device.post("/opaque/set-password/complete", { registrationRecord: b.registrationRecord }),
 		]);
 
 		expect([resA.status, resB.status].sort()).toEqual([200, 400]);
 		const loser = resA.status === 400 ? resA : resB;
-		expect(loser.body?.code).toBe("OPAQUE_ACCOUNT_ALREADY_EXISTS");
+		// The loser either found the winner's account or found no challenge slot left.
+		expect(["OPAQUE_ACCOUNT_ALREADY_EXISTS", "SET_PASSWORD_CHALLENGE_REQUIRED"]).toContain(loser.body?.code);
 		expect(await h.db.opaqueAccounts(email)).toHaveLength(1);
 		const [winnerPw, loserPw] = resA.status === 200 ? [pwA, pwB] : [pwB, pwA];
 		expect(await canLogIn(email, winnerPw)).toBe(true);
 		expect(await canLogIn(email, loserPw)).toBe(false);
+	});
+});
+
+describe("set password: the challenge is required", () => {
+	test("complete without a prior challenge: 400 SET_PASSWORD_CHALLENGE_REQUIRED, no account", async () => {
+		const { email, device } = await coreUser("setpw-nochallenge");
+		const registrationRecord = await someRegistrationRecord(email);
+
+		const res = await device.post("/opaque/set-password/complete", { registrationRecord });
+
+		expectCode(res, 400, "SET_PASSWORD_CHALLENGE_REQUIRED");
+		expect(await h.db.opaqueAccounts(email)).toHaveLength(0);
+	});
+
+	test("complete after the challenge expired (15 minutes): 400 SET_PASSWORD_CHALLENGE_REQUIRED, no account", async () => {
+		const { email, device } = await coreUser("setpw-expired");
+		const started = await startSetPassword(device, OPAQUE_PASSWORD);
+		expect(started.res.status).toBe(200);
+
+		setSystemTime(new Date(Date.now() + 16 * 60 * 1000));
+
+		const res = await device.post("/opaque/set-password/complete", { registrationRecord: started.registrationRecord });
+		expectCode(res, 400, "SET_PASSWORD_CHALLENGE_REQUIRED");
+		expect(await h.db.opaqueAccounts(email)).toHaveLength(0);
+	});
+
+	test("a user who already has an OPAQUE account still gets OPAQUE_ACCOUNT_ALREADY_EXISTS, with or without a challenge", async () => {
+		const email = uniqueEmail("setpw-has-nochallenge");
+		await h.register(email, "existing opaque password");
+		const device = await h.loggedInDevice(email, "existing opaque password");
+		const res = await device.post("/opaque/set-password/complete", {
+			registrationRecord: await someRegistrationRecord(email),
+		});
+		expectCode(res, 400, "OPAQUE_ACCOUNT_ALREADY_EXISTS");
 	});
 });
 
