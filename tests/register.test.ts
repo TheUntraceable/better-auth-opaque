@@ -13,6 +13,7 @@ const h = await createTestHarness();
 const hAutoSession = await createTestHarness({ plugin: { insecureCreateSessionOnRegister: true } });
 /** A required, client-settable additional user field. */
 const hFields = await createTestHarness({
+	emailAndPassword: true, // core /sign-up/email as the control
 	authOptions: { user: { additionalFields: { plan: { type: "string", required: true, input: true } } } },
 });
 await ready;
