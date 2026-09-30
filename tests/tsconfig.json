@@ -1,0 +1,13 @@
+{
+	// Type-checks the test suite (the root tsconfig only covers src/ for the build).
+	"extends": "../tsconfig.json",
+	"compilerOptions": {
+		"noEmit": true,
+		"rootDir": "..",
+		"declaration": false,
+		"declarationMap": false,
+		"sourceMap": false
+	},
+	"include": ["./**/*.ts", "../src/**/*.ts"],
+	"exclude": []
+}

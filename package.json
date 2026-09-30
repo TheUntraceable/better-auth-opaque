@@ -18,6 +18,8 @@
 	],
 	"scripts": {
 		"build": "tsc",
+		"test": "bun test",
+		"typecheck": "tsc --noEmit && tsc --noEmit -p tests",
 		"prepublishOnly": "npm run build"
 	},
 	"devDependencies": {
