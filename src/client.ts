@@ -1,3 +1,4 @@
+import { BASE_ERROR_CODES } from "@better-auth/core/error";
 import { client, ready } from "@serenity-kit/opaque";
 import type {
 	BetterAuthClientOptions,
@@ -17,6 +18,24 @@ export { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "./error-codes.js";
 /* -------------------------------------------------------------------------- */
 /*                                Public types                                */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * Argon2id configuration of the OPAQUE client library (`@serenity-kit/opaque`),
+ * which does not export the type under a name of its own.
+ */
+export type KeyStretchingFunctionConfig = NonNullable<client.FinishRegistrationParams["keyStretching"]>;
+
+/** Options of `opaqueClient()`. */
+export interface OpaqueClientOptions {
+	/**
+	 * Key stretching (Argon2id) applied to the password whenever the client
+	 * finishes a registration or a login. Must be the same for every client of
+	 * a deployment: a record registered with one configuration only logs in
+	 * with that same configuration. Default: the library default
+	 * (`"memory-constrained"`).
+	 */
+	keyStretching?: KeyStretchingFunctionConfig | undefined;
+}
 
 /**
  * The error of a failed action: the server's error body (`code`, `message`)
@@ -60,6 +79,8 @@ export type SignUpOpaqueInput = WithFetchOptions<{
 	email: string;
 	name: string;
 	password: string;
+	/** Where the email verification link sends the user once verified. */
+	callbackURL?: string | undefined;
 }>;
 
 export type SignInOpaqueInput = WithFetchOptions<{
@@ -70,6 +91,11 @@ export type SignInOpaqueInput = WithFetchOptions<{
 	 * (sends `dontRememberMe: true`). Default `true`.
 	 */
 	rememberMe?: boolean | undefined;
+	/**
+	 * Where the email verification link sends the user, when signing in
+	 * re-sends one (unverified email with verification required).
+	 */
+	callbackURL?: string | undefined;
 }>;
 
 export type ChangePasswordOpaqueInput = WithFetchOptions<{
@@ -238,11 +264,12 @@ function finishLoginSafely(params: Parameters<typeof client.finishLogin>[0]) {
  * unchanged but replaces any plain object with a path proxy, so a plain object
  * here would read back as proxies (`$ERROR_CODES.X.code` would not be a
  * string). A function carrying the codes as own enumerable properties is the
- * one shape that reaches callers intact. Codes from every client plugin that
- * declares `$ERROR_CODES` are included, since only one plugin can own the key.
+ * one shape that reaches callers intact. Better Auth's core codes and the
+ * codes of every client plugin that declares `$ERROR_CODES` are included, since
+ * only one plugin can own the key (OPAQUE's own codes win on a clash).
  */
 function runtimeErrorCodes(options: BetterAuthClientOptions | undefined) {
-	const codes: Record<string, { code: string; message: string }> = {};
+	const codes: Record<string, { code: string; message: string }> = { ...BASE_ERROR_CODES };
 	for (const plugin of options?.plugins ?? []) {
 		if (plugin.$ERROR_CODES) Object.assign(codes, plugin.$ERROR_CODES);
 	}
@@ -256,7 +283,11 @@ function runtimeErrorCodes(options: BetterAuthClientOptions | undefined) {
 /*                                   Plugin                                   */
 /* -------------------------------------------------------------------------- */
 
-export const opaqueClient = () => {
+export const opaqueClient = (options?: OpaqueClientOptions) => {
+	// Forwarded to every library call that stretches the password; omitted
+	// entirely when unset so the library applies its own default.
+	const stretch: { keyStretching?: KeyStretchingFunctionConfig } =
+		options?.keyStretching === undefined ? {} : { keyStretching: options.keyStretching };
 	return {
 		id: "opaque",
 		$InferServerPlugin: {} as ReturnType<typeof opaque>,
@@ -267,12 +298,15 @@ export const opaqueClient = () => {
 
 			const actions = {
 				signUp: {
-					/** Register with OPAQUE. Does not create a session. */
+					/**
+					 * Register with OPAQUE. Creates a session only when the server enables
+					 * `insecureCreateSessionOnRegister`.
+					 */
 					opaque: async (
 						data: SignUpOpaqueInput,
 						fetchOptions?: OpaqueFetchOptions,
 					): Promise<OpaqueClientResult<SignUpOpaqueData>> => {
-						const { email, name, password, fetchOptions: inline } = data;
+						const { email, name, password, callbackURL, fetchOptions: inline } = data;
 						const f = flow(inline, fetchOptions);
 						await ready;
 						const { clientRegistrationState, registrationRequest } = client.startRegistration({ password });
@@ -285,12 +319,17 @@ export const opaqueClient = () => {
 							clientRegistrationState,
 							password,
 							registrationResponse: challenge.data.challenge,
+							...stretch,
 						});
-						return await f.finish<SignUpOpaqueData>("/sign-up/opaque/complete", {
+						const res = await f.finish<SignUpOpaqueData>("/sign-up/opaque/complete", {
 							email,
 							name,
 							registrationRecord,
+							...(callbackURL === undefined ? {} : { callbackURL }),
 						});
+						// The server may have created a session (insecureCreateSessionOnRegister).
+						if (!res.error) f.notifySession();
+						return res;
 					},
 				},
 				signIn: {
@@ -299,7 +338,7 @@ export const opaqueClient = () => {
 						data: SignInOpaqueInput,
 						fetchOptions?: OpaqueFetchOptions,
 					): Promise<OpaqueClientResult<SignInOpaqueData>> => {
-						const { email, password, rememberMe, fetchOptions: inline } = data;
+						const { email, password, rememberMe, callbackURL, fetchOptions: inline } = data;
 						const f = flow(inline, fetchOptions);
 						await ready;
 						const { clientLoginState, startLoginRequest } = client.startLogin({ password });
@@ -309,7 +348,7 @@ export const opaqueClient = () => {
 						});
 						if (challenge.error) return challenge;
 						const { challenge: loginResponse, state: encryptedServerState } = challenge.data;
-						const loginAttempt = finishLoginSafely({ password, clientLoginState, loginResponse });
+						const loginAttempt = finishLoginSafely({ password, clientLoginState, loginResponse, ...stretch });
 						if (!loginAttempt) {
 							return await f.fail(401, OPAQUE_ERROR_CODES.INVALID_EMAIL_OR_PASSWORD);
 						}
@@ -317,6 +356,7 @@ export const opaqueClient = () => {
 							loginResult: loginAttempt.finishLoginRequest,
 							encryptedServerState,
 							...(rememberMe === false ? { dontRememberMe: true } : {}),
+							...(callbackURL === undefined ? {} : { callbackURL }),
 						});
 						if (!res.error) f.notifySession();
 						return res;
@@ -344,7 +384,7 @@ export const opaqueClient = () => {
 							loginChallenge: string;
 							registrationChallenge: string;
 							state: string;
-						}>("/opaque/changePassword/challenge", {
+						}>("/opaque/change-password/challenge", {
 							loginRequest: startLoginRequest,
 							registrationRequest,
 						});
@@ -354,6 +394,7 @@ export const opaqueClient = () => {
 							password: currentPassword,
 							clientLoginState,
 							loginResponse: loginChallenge,
+							...stretch,
 						});
 						if (!loginAttempt) {
 							return await f.fail(401, OPAQUE_ERROR_CODES.INVALID_CURRENT_PASSWORD);
@@ -362,8 +403,9 @@ export const opaqueClient = () => {
 							clientRegistrationState,
 							password: newPassword,
 							registrationResponse: registrationChallenge,
+							...stretch,
 						});
-						const res = await f.finish<ChangePasswordOpaqueData>("/opaque/changePassword/complete", {
+						const res = await f.finish<ChangePasswordOpaqueData>("/opaque/change-password/complete", {
 							loginResult: loginAttempt.finishLoginRequest,
 							registrationRecord,
 							encryptedServerState,
@@ -416,6 +458,7 @@ export const opaqueClient = () => {
 							clientRegistrationState,
 							password: newPassword,
 							registrationResponse: challenge.data.challenge,
+							...stretch,
 						});
 						const res = await f.finish<StatusData>("/opaque/reset-password/complete", {
 							...credential,
@@ -440,7 +483,7 @@ export const opaqueClient = () => {
 						const { clientRegistrationState, registrationRequest } = client.startRegistration({
 							password: newPassword,
 						});
-						const challenge = await f.step<{ challenge: string }>("/opaque/setPassword/challenge", {
+						const challenge = await f.step<{ challenge: string }>("/opaque/set-password/challenge", {
 							registrationRequest,
 						});
 						if (challenge.error) return challenge;
@@ -448,8 +491,9 @@ export const opaqueClient = () => {
 							clientRegistrationState,
 							password: newPassword,
 							registrationResponse: challenge.data.challenge,
+							...stretch,
 						});
-						return await f.finish<StatusData>("/opaque/setPassword/complete", { registrationRecord });
+						return await f.finish<StatusData>("/opaque/set-password/complete", { registrationRecord });
 					},
 				},
 			};
