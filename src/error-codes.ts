@@ -1,19 +1,21 @@
 /*
- * Dependency-free on purpose: shared by the server plugin and the browser
- * client, so importing it must never pull in server code.
+ * Shared by the server plugin and the browser client, so importing it must
+ * never pull in server code: the only import is Better Auth core's error-code
+ * table (`@better-auth/core/error`, which the client imports as well).
  */
+import { BASE_ERROR_CODES } from "@better-auth/core/error";
 
 /**
  * Stable error codes returned by the OPAQUE endpoints, in Better Auth's
  * `{ code, message }` convention (usable with `APIError.from`).
+ *
+ * Codes that mean the same thing as one of Better Auth core's are core's own
+ * entries (same code, same message), so an app can handle both the same way.
  */
 export const OPAQUE_ERROR_CODES = {
-	/** Wrong password, unknown user, replayed/unknown challenge. Deliberately generic. */
-	INVALID_EMAIL_OR_PASSWORD: {
-		code: "INVALID_EMAIL_OR_PASSWORD",
-		message: "Invalid email or password",
-	},
-	/** Change password: current password did not verify, or the challenge was replayed. */
+	/** Wrong password, unknown user, replayed/unknown/stale challenge. Deliberately generic. Core's entry. */
+	INVALID_EMAIL_OR_PASSWORD: BASE_ERROR_CODES.INVALID_EMAIL_OR_PASSWORD,
+	/** Change password: current password did not verify, or the challenge was replayed or is stale. */
 	INVALID_CURRENT_PASSWORD: {
 		code: "INVALID_CURRENT_PASSWORD",
 		message: "Invalid current password",
@@ -34,6 +36,7 @@ export const OPAQUE_ERROR_CODES = {
 		code: "INVALID_LOGIN_RESULT",
 		message: "Invalid login result",
 	},
+	/** The encrypted challenge state is malformed, tampered with, or belongs to another flow. */
 	INVALID_LOGIN_STATE: {
 		code: "INVALID_LOGIN_STATE",
 		message: "Invalid login state",
@@ -47,20 +50,13 @@ export const OPAQUE_ERROR_CODES = {
 		code: "OPAQUE_ACCOUNT_NOT_FOUND",
 		message: "No OPAQUE account found for this user",
 	},
-	FAILED_TO_CREATE_SESSION: {
-		code: "FAILED_TO_CREATE_SESSION",
-		message: "Failed to create session",
-	},
-	/** Reset password: unknown, expired, used or wrong link token / code (or not exactly one credential). */
-	INVALID_TOKEN: {
-		code: "INVALID_TOKEN",
-		message: "Invalid token",
-	},
-	/** Reset password: the code was guessed wrong too many times; request a new one. */
-	TOO_MANY_ATTEMPTS: {
-		code: "TOO_MANY_ATTEMPTS",
-		message: "Too many attempts",
-	},
+	/** Core's entry. */
+	FAILED_TO_CREATE_SESSION: BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
+	/**
+	 * Reset password: unknown, expired, used, locked (too many wrong codes) or
+	 * superseded link token / code, or not exactly one credential. Core's entry.
+	 */
+	INVALID_TOKEN: BASE_ERROR_CODES.INVALID_TOKEN,
 	/** Forgot password: the requested delivery method (link / otp) is not configured on the server. */
 	RESET_PASSWORD_METHOD_NOT_CONFIGURED: {
 		code: "RESET_PASSWORD_METHOD_NOT_CONFIGURED",
@@ -71,11 +67,13 @@ export const OPAQUE_ERROR_CODES = {
 		code: "OPAQUE_ACCOUNT_ALREADY_EXISTS",
 		message: "An OPAQUE password is already set for this user",
 	},
-	/** Login: correct password, but the email is not verified (requireEmailVerification). */
-	EMAIL_NOT_VERIFIED: {
-		code: "EMAIL_NOT_VERIFIED",
-		message: "Email not verified",
+	/** Set password: complete without a live challenge (none, expired, or already used). */
+	SET_PASSWORD_CHALLENGE_REQUIRED: {
+		code: "SET_PASSWORD_CHALLENGE_REQUIRED",
+		message: "Request a set-password challenge first",
 	},
+	/** Login: correct password, but the email is not verified (requireEmailVerification). Core's entry. */
+	EMAIL_NOT_VERIFIED: BASE_ERROR_CODES.EMAIL_NOT_VERIFIED,
 } as const;
 
 export type OpaqueErrorCode = keyof typeof OPAQUE_ERROR_CODES;
