@@ -9,8 +9,10 @@ import type {
 	RequestContext,
 	SuccessContext,
 } from "better-auth/client";
+import { OPAQUE_ERROR_CODES } from "./error-codes";
 import type { opaque } from "./server";
-import { OPAQUE_ERROR_CODES } from "./utils";
+
+export { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "./error-codes";
 
 /* -------------------------------------------------------------------------- */
 /*                                Public types                                */
