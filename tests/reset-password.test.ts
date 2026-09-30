@@ -415,6 +415,26 @@ describe("reset with link token: complete", () => {
 		expect(login.data?.user.id).toBe(user.id);
 	});
 
+	test("a successful reset marks the email verified (link and OTP both prove the mailbox); a failed one does not", async () => {
+		const viaLink = await opaqueUser(hLink, "rp-verify-link");
+		const viaOtp = await opaqueUser(hOTP, "rp-verify-otp");
+		expect((await hLink.db.user(viaLink.email))!.emailVerified).toBe(false);
+		expect((await hOTP.db.user(viaOtp.email))!.emailVerified).toBe(false);
+
+		const { mail } = await requestLink(hLink, viaLink.email);
+		expectCode(await complete(hLink, { token: mail.token }, UNDESERIALISABLE_RECORD), 400, "INVALID_REGISTRATION_RECORD");
+		expect((await hLink.db.user(viaLink.email))!.emailVerified).toBe(false);
+		expect((await rawResetPassword(hLink.device(), { token: mail.token }, NEW_PASSWORD)).complete.status).toBe(200);
+		expect((await hLink.db.user(viaLink.email))!.emailVerified).toBe(true);
+
+		const { otp } = await requestOTP(hOTP, viaOtp.email);
+		const wrong = otp === "000000" ? "111111" : "000000";
+		expectCode(await challenge(hOTP, { email: viaOtp.email, otp: wrong }), 400, "INVALID_TOKEN");
+		expect((await hOTP.db.user(viaOtp.email))!.emailVerified).toBe(false);
+		expect((await rawResetPassword(hOTP.device(), { email: viaOtp.email, otp }, NEW_PASSWORD)).complete.status).toBe(200);
+		expect((await hOTP.db.user(viaOtp.email))!.emailVerified).toBe(true);
+	});
+
 	test("an OPAQUE reset token is useless at core's POST /reset-password (no credential password can be set with it)", async () => {
 		const { email } = await opaqueUser(hLink, "rp-core-iso");
 		const { mail } = await requestLink(hLink, email);
