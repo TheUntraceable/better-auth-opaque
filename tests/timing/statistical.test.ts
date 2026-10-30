@@ -1,6 +1,10 @@
 import { client as opaqueCrypto, ready } from "@serenity-kit/opaque";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import { createOpaqueTestInstance } from "../helpers";
+
+// Each test here runs 50 to 200 full handshakes (client Argon2 included), far
+// past the suite's 60s default; budget accordingly.
+vi.setConfig({ testTimeout: 15 * 60_000 });
 
 describe.skipIf(!process.env.OPAQUE_TIMING_TESTS)("timing attack resistance", async () => {
 	await ready;
