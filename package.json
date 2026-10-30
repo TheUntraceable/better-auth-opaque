@@ -18,6 +18,7 @@
 	],
 	"scripts": {
 		"build": "tsc",
+		"typecheck": "tsc -p tsconfig.test.json",
 		"prepublishOnly": "npm run build"
 	},
 	"devDependencies": {

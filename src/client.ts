@@ -9,10 +9,39 @@ type LoginComplete = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["
 type ChangePasswordChallengeResponse = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["getChangePasswordChallenge"]>>
 type ChangePasswordComplete = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["completeChangePassword"]>>
 
+/**
+ * Minimal structural view of better-auth's `$fetch`.
+ *
+ * Deliberately self-contained: letting `$fetch` be inferred emits a
+ * reference to `BetterFetch` from `@better-fetch/fetch` in the `.d.ts`, and
+ * consumers' TypeScript then fails to match it against the `$fetch` type
+ * better-auth declares, even when both resolve the same copy of that
+ * package, with "Types of property 'getActions' are incompatible" and the
+ * loss of all `authClient.*.opaque` inference.
+ * `tests/client-plugin-types.ts` asserts `BetterFetch` stays assignable to
+ * this.
+ */
+export type OpaqueFetch = <T = unknown>(
+	url: string,
+	options?: {
+		method?: string;
+		body?: unknown;
+		[key: string]: unknown;
+	},
+) => Promise<{
+	data: T | null;
+	error: {
+		code?: string | undefined;
+		message?: string | undefined;
+		status: number;
+		statusText: string;
+	} | null;
+}>;
+
 export const opaqueClient = () => {
 	return {
 		id: "opaque",
-		getActions($fetch) {
+		getActions($fetch: OpaqueFetch) {
 			return {
 				signUp: {
 					opaque: async ({ email, name, password }: {

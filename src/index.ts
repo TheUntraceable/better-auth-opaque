@@ -1,2 +1,2 @@
-export { opaqueClient } from "./client";
+export { opaqueClient, type OpaqueFetch } from "./client";
 export { opaque } from "./server";
