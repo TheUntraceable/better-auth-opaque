@@ -1,6 +1,29 @@
 {
 	"name": "better-auth-opaque",
 	"version": "3.0.0",
+	"description": "OPAQUE (RFC 9807) password authentication for Better Auth: the password never leaves the device, and every login hands the client an export key the server never learns.",
+	"keywords": [
+		"better-auth",
+		"better-auth-plugin",
+		"opaque",
+		"pake",
+		"apake",
+		"rfc9807",
+		"authentication",
+		"password",
+		"zero-knowledge",
+		"end-to-end-encryption"
+	],
+	"license": "MIT",
+	"author": "Ridhwan Hussain",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/TheUntraceable/better-auth-opaque.git"
+	},
+	"homepage": "https://github.com/TheUntraceable/better-auth-opaque#readme",
+	"bugs": {
+		"url": "https://github.com/TheUntraceable/better-auth-opaque/issues"
+	},
 	"type": "module",
 	"main": "./dist/index.js",
 	"module": "./dist/index.js",
@@ -24,13 +47,16 @@
 		"README.md",
 		"LICENSE.md"
 	],
+	"sideEffects": false,
 	"scripts": {
 		"build": "tsc",
-		"prepublishOnly": "npm run build && npm test",
+		"typecheck": "tsc -p tsconfig.test.json",
 		"test": "bunx --bun vitest run",
+		"test:node": "vitest run",
 		"test:timing": "cross-env OPAQUE_TIMING_TESTS=1 bunx --bun vitest run tests/timing/ --no-file-parallelism",
 		"test:server": "bun tests/server.ts",
-		"test:node": "vitest run"
+		"check": "bun run typecheck && bun run build && bun run test",
+		"prepublishOnly": "bun run check"
 	},
 	"devDependencies": {
 		"@types/bun": "latest",
@@ -50,6 +76,5 @@
 	},
 	"dependencies": {
 		"@serenity-kit/opaque": "^0.9.0"
-	},
-	"sideEffects": false
+	}
 }

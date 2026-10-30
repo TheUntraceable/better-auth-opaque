@@ -161,6 +161,67 @@ describe("opaque: sign-up and sign-in", () => {
 		expect(errorCode(replay)).toBe("INVALID_LOGIN_STATE");
 	});
 
+	test("a sign-up state can be used exactly once", async () => {
+		const email = uniqueEmail("signup-replay");
+		const { clientRegistrationState, registrationRequest } =
+			opaqueCrypto.startRegistration({ password });
+		const challenge = await t.client.$fetch<{ challenge: string; state: string }>(
+			"/opaque/sign-up/challenge",
+			{ method: "POST", body: { email, registrationRequest } },
+		);
+		const { registrationRecord } = opaqueCrypto.finishRegistration({
+			clientRegistrationState,
+			password,
+			registrationResponse: challenge.data!.challenge,
+		});
+		const body = { email, name: "Replay", registrationRecord, state: challenge.data!.state };
+		const first = await t.client.$fetch<{ status: boolean }>(
+			"/opaque/sign-up/complete",
+			{ method: "POST", body },
+		);
+		expect(first.data?.status).toBe(true);
+		const replay = await t.client.$fetch("/opaque/sign-up/complete", {
+			method: "POST",
+			body,
+		});
+		expect(replay.error?.status).toBe(400);
+		expect(errorCode(replay)).toBe("INVALID_LOGIN_STATE");
+	});
+
+	test("concurrent completes with the same state yield at most one session", async () => {
+		const email = uniqueEmail("race");
+		await t.client.signUp.opaque({ email, name: "Race", password });
+		const { clientLoginState, startLoginRequest } = opaqueCrypto.startLogin({
+			password,
+		});
+		const challenge = await t.client.$fetch<{ challenge: string; state: string }>(
+			"/opaque/sign-in/challenge",
+			{ method: "POST", body: { email, loginRequest: startLoginRequest } },
+		);
+		const login = opaqueCrypto.finishLogin({
+			clientLoginState,
+			loginResponse: challenge.data!.challenge,
+			password,
+		});
+		const body = {
+			loginResult: login!.finishLoginRequest,
+			state: challenge.data!.state,
+		};
+		const results = await Promise.all(
+			Array.from({ length: 4 }, () =>
+				t.client.$fetch<{ token: string }>("/opaque/sign-in/complete", {
+					method: "POST",
+					body,
+				}),
+			),
+		);
+		const sessions = results.filter((r) => r.data?.token);
+		expect(sessions).toHaveLength(1);
+		for (const r of results.filter((r) => !r.data?.token)) {
+			expect(errorCode(r)).toBe("INVALID_LOGIN_STATE");
+		}
+	});
+
 	test("rejects a malformed registration record before storing it", async () => {
 		const email = uniqueEmail("badrecord");
 		const { registrationRequest } = opaqueCrypto.startRegistration({ password });
@@ -210,6 +271,26 @@ describe("opaque: sign-up and sign-in", () => {
 		});
 		expect(result.error).toBeNull();
 		expect(setCookies.join("\n")).toContain("dont_remember");
+	});
+
+	test("forwards fetchOptions to every request of a flow", async () => {
+		const email = uniqueEmail("fetchopts");
+		await t.client.signUp.opaque({ email, name: "Fetch", password });
+		const seen: string[] = [];
+		const signIn = await t.client.signIn.opaque(
+			{ email, password },
+			{
+				headers: { "x-opaque-test": "1" },
+				onResponse: ({ response }) => {
+					seen.push(new URL(response.url).pathname);
+				},
+			},
+		);
+		expect(signIn.error).toBeNull();
+		expect(seen).toEqual([
+			"/api/auth/opaque/sign-in/challenge",
+			"/api/auth/opaque/sign-in/complete",
+		]);
 	});
 
 	test("accepts additional user fields on sign-up", async () => {
@@ -469,6 +550,40 @@ describe("opaque: password reset", () => {
 			newPassword: "whatever-whatever",
 		});
 		expect(result.error?.code).toBe("INVALID_TOKEN");
+	});
+});
+
+describe("opaque: hooks that throw", () => {
+	let t: OpaqueTestInstance;
+
+	beforeAll(async () => {
+		await ready;
+		t = await createOpaqueTestInstance({
+			onExistingUserSignUp: () => {
+				throw new Error("mailer down");
+			},
+			sendResetPassword: async () => {
+				throw new Error("mailer down");
+			},
+		});
+	});
+	afterAll(() => t.server.close());
+
+	test("never change the response, so a failing mailer is not an existence oracle", async () => {
+		const email = uniqueEmail("hooks");
+		expect((await t.client.signUp.opaque({ email, name: "Hooks", password })).error).toBeNull();
+
+		const duplicate = await t.client.signUp.opaque({ email, name: "Hooks", password });
+		expect(duplicate.error).toBeNull();
+		expect(duplicate.data?.status).toBe(true);
+
+		const known = await t.client.opaque.requestPasswordReset({ email });
+		const unknown = await t.client.opaque.requestPasswordReset({
+			email: uniqueEmail("nobody"),
+		});
+		expect(known.error).toBeNull();
+		expect(unknown.error).toBeNull();
+		expect(known.data).toEqual(unknown.data);
 	});
 });
 

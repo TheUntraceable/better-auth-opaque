@@ -1,0 +1,16 @@
+{
+	// Type-checks the test suite together with the sources. vitest runs tests
+	// through esbuild, which strips types without checking them, so the
+	// compile-time assertions in tests/client-plugin-types.test.ts only bite
+	// when this config is run (`bun run typecheck`).
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"noEmit": true,
+		"rootDir": ".",
+		"declaration": false,
+		"declarationMap": false,
+		"sourceMap": false
+	},
+	"include": ["src/**/*", "tests/**/*", "vitest.config.ts"],
+	"exclude": ["node_modules", "dist"]
+}

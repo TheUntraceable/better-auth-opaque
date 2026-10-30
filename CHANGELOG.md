@@ -25,7 +25,7 @@ Changes are relative to 2.0.3, the last published release.
 - `opaque.requestPasswordReset` / `opaque.resetPassword` with `sendResetPassword`, `resetPasswordTokenExpiresIn`, and a redirect endpoint.
 - `onExistingUserSignUp` hook.
 - Verification emails on sign-up when `emailVerification.sendOnSignUp` or `requireEmailVerification` is set.
-- `rememberMe` support, `useSession` refresh after sign-in and password change, `fetchOptions` second argument on every action.
+- `rememberMe` support, `useSession` refresh after sign-in, password change and reset, `fetchOptions` second argument on every action (typed: headers, query, signal, better-fetch hooks).
 - Additional user fields and `image` accepted at sign-up.
 - Plugin-level rate limit (5 req / 10 s / IP / path) on every `/opaque/*` endpoint.
 - `OPAQUE_ERROR_CODES` with typed error codes on both plugins.
@@ -41,10 +41,16 @@ Changes are relative to 2.0.3, the last published release.
 - Change-password uses the authoritative (`sensitiveSessionMiddleware`) session.
 - Debug logs no longer include emails or whether an account exists.
 - Base64url field lengths are validated exactly against the sizes `@serenity-kit/opaque` produces.
+- Sign-up challenges are single-use like every other flow; previously the sign-up state could be replayed within its lifetime.
+- Handshake states and reset tokens are consumed atomically (`consumeVerificationValue`), so concurrent requests with the same state or token cannot both succeed.
+- A throwing `onExistingUserSignUp`, `sendResetPassword` or `sendVerificationEmail` is logged instead of becoming a 500 on only the branch where the account exists.
 
 ### Internal
 
 - Test suite runs on `better-auth/test`'s HTTP test instance under vitest (no external server). Statistical timing tests are opt-in via `OPAQUE_TIMING_TESTS=1`.
+- `bun run typecheck` type-checks the tests (vitest alone never did, so the compile-time plugin-typing assertions were not enforced); `bun run check` runs typecheck, build and tests and backs `prepublishOnly`.
+- GitHub Actions: CI on every push and pull request, and an npm publish with provenance on GitHub releases.
+- npm metadata (description, keywords, repository, license) on the package.
 
 ## 2.0.3
 

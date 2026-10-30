@@ -82,13 +82,28 @@ export const opaque = (options: OpaqueOptions = {}) => {
 					value: string;
 					expiresAt: Date;
 				}) => Promise<unknown>;
-				findVerificationValue: (
+				consumeVerificationValue: (
 					identifier: string,
 				) => Promise<{ value: string; expiresAt: Date } | null | undefined>;
-				deleteVerificationByIdentifier: (identifier: string) => Promise<void>;
 			};
 		};
 	};
+
+	type HookCtx = {
+		context: {
+			runInBackgroundOrAwait: (promise: Promise<unknown>) => unknown;
+		};
+	};
+
+	/**
+	 * Runs an app-supplied hook (mailer, notification) without letting it
+	 * change the HTTP response. Mailers fail; a 500 that only happens on the
+	 * "account exists" branch would be an enumeration oracle, so better-auth's
+	 * background runner logs the error and the endpoint answers as normal.
+	 * Honours `advanced.backgroundTasks` like core does.
+	 */
+	const runHook = (ctx: HookCtx, hook: () => unknown) =>
+		ctx.context.runInBackgroundOrAwait(Promise.resolve().then(hook));
 
 	// Issue a one-time, purpose-bound state. The stateId is recorded so the
 	// complete step can consume it exactly once.
@@ -108,6 +123,10 @@ export const opaque = (options: OpaqueOptions = {}) => {
 		);
 	};
 
+	// Decrypt a state and burn its one-time marker. The marker is consumed
+	// atomically (better-auth's consumeVerificationValue), so two requests
+	// racing with the same state cannot both pass; it also returns null for
+	// an expired row, so there is no separate expiry check to get wrong.
 	const consumeState = async (ctx: Ctx, encrypted: string, purpose: string) => {
 		const decoded = await decryptState(
 			encrypted,
@@ -115,19 +134,15 @@ export const opaque = (options: OpaqueOptions = {}) => {
 			purpose,
 			challengeTtlMs,
 		);
-		const identifier = stateIdentifier(decoded.stateId);
-		const record = await ctx.context.internalAdapter.findVerificationValue(
-			identifier,
+		const marker = await ctx.context.internalAdapter.consumeVerificationValue(
+			stateIdentifier(decoded.stateId),
 		);
-		if (!record || record.value !== purpose || record.expiresAt < new Date()) {
+		if (!marker || marker.value !== purpose) {
 			throw APIError.from(
 				"BAD_REQUEST",
 				OPAQUE_ERROR_CODES.INVALID_LOGIN_STATE,
 			);
 		}
-		await ctx.context.internalAdapter.deleteVerificationByIdentifier(
-			identifier,
-		);
 		return decoded;
 	};
 
@@ -238,16 +253,11 @@ export const opaque = (options: OpaqueOptions = {}) => {
 						userIdentifier: credentialId,
 						registrationRequest: ctx.body.registrationRequest,
 					});
-					const encrypted = await encryptState(
-						{
-							purpose: PURPOSE.signUp,
-							stateId: generateRandomString(32),
-							issuedAt: Date.now(),
-							email,
-							credentialId,
-						},
-						ctx.context.secret,
-					);
+					const encrypted = await issueState(ctx, {
+						purpose: PURPOSE.signUp,
+						email,
+						credentialId,
+					});
 					return { challenge: registrationResponse, state: encrypted };
 				},
 			),
@@ -288,12 +298,7 @@ export const opaque = (options: OpaqueOptions = {}) => {
 							...rest
 						} = ctx.body;
 						const email = normalizeEmail(rawEmail);
-						const decoded = await decryptState(
-							encrypted,
-							ctx.context.secret,
-							PURPOSE.signUp,
-							challengeTtlMs,
-						);
+						const decoded = await consumeState(ctx, encrypted, PURPOSE.signUp);
 						if (decoded.email !== email || !decoded.credentialId) {
 							throw APIError.from(
 								"BAD_REQUEST",
@@ -310,9 +315,8 @@ export const opaque = (options: OpaqueOptions = {}) => {
 							email,
 						);
 						if (existing) {
-							await options.onExistingUserSignUp?.(
-								{ user: existing.user },
-								ctx.request,
+							await runHook(ctx, () =>
+								options.onExistingUserSignUp?.({ user: existing.user }, ctx.request),
 							);
 							return { status: true, token: null };
 						}
@@ -367,11 +371,9 @@ export const opaque = (options: OpaqueOptions = {}) => {
 								emailVerification.expiresIn,
 							);
 							const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(callbackURL || "/")}`;
-							await ctx.context.runInBackgroundOrAwait(
-								emailVerification.sendVerificationEmail(
-									{ user, url, token },
-									ctx.request,
-								),
+							const sendVerificationEmail = emailVerification.sendVerificationEmail;
+							await runHook(ctx, () =>
+								sendVerificationEmail({ user, url, token }, ctx.request),
 							);
 						}
 
@@ -521,11 +523,9 @@ export const opaque = (options: OpaqueOptions = {}) => {
 								emailVerification.expiresIn,
 							);
 							const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(ctx.body.callbackURL || "/")}`;
-							await ctx.context.runInBackgroundOrAwait(
-								emailVerification.sendVerificationEmail(
-									{ user, url, token },
-									ctx.request,
-								),
+							const sendVerificationEmail = emailVerification.sendVerificationEmail;
+							await runHook(ctx, () =>
+								sendVerificationEmail({ user, url, token }, ctx.request),
 							);
 						}
 						throw APIError.from(
@@ -847,7 +847,9 @@ export const opaque = (options: OpaqueOptions = {}) => {
 							email,
 						);
 						if (!found) {
-							// Match the real branch's write so the two look alike.
+							// Touch the verification table on this branch too so the
+							// query pattern matches the real one. The real branch's
+							// insert and mailer are what timingSafeResponseMs is for.
 							await ctx.context.internalAdapter.findVerificationValue(
 								resetIdentifier("dummy"),
 							);
@@ -861,11 +863,9 @@ export const opaque = (options: OpaqueOptions = {}) => {
 						});
 						const callbackURL = encodeURIComponent(ctx.body.redirectTo ?? "");
 						const url = `${ctx.context.baseURL}/opaque/reset-password/${token}?callbackURL=${callbackURL}`;
-						await ctx.context.runInBackgroundOrAwait(
-							options.sendResetPassword(
-								{ user: found.user, url, token },
-								ctx.request,
-							),
+						const sendResetPassword = options.sendResetPassword;
+						await runHook(ctx, () =>
+							sendResetPassword({ user: found.user, url, token }, ctx.request),
 						);
 						return { status: true };
 					} finally {
@@ -994,6 +994,15 @@ export const opaque = (options: OpaqueOptions = {}) => {
 						decoded.newCredentialId,
 						ctx.body.registrationRecord,
 					);
+					// Burn the token atomically before touching the record, so two
+					// resets racing with the same link cannot both write.
+					if (
+						!(await ctx.context.internalAdapter.consumeVerificationValue(
+							identifier,
+						))
+					) {
+						throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
+					}
 					const account = await findOpaqueAccount(ctx, user.id);
 					if (account) {
 						await ctx.context.internalAdapter.updateAccount(account.id, {
@@ -1011,9 +1020,6 @@ export const opaque = (options: OpaqueOptions = {}) => {
 							typeof ctx.context.internalAdapter.createAccount
 						>[0]);
 					}
-					await ctx.context.internalAdapter.deleteVerificationByIdentifier(
-						identifier,
-					);
 					await ctx.context.internalAdapter.deleteUserSessions(user.id);
 					return { status: true };
 				},

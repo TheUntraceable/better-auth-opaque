@@ -35,7 +35,41 @@ export type OpaqueResult<T> =
 	| { data: T; error: null }
 	| { data: null; error: OpaqueClientError };
 
-export type OpaqueFetchOptions = Record<string, unknown>;
+/**
+ * Per-call options forwarded to better-auth's `$fetch`: `headers`, `query`,
+ * `signal`, the `onRequest` / `onResponse` / `onSuccess` / `onError` hooks,
+ * and anything else `@better-fetch/fetch` accepts. The plugin sets `method`
+ * and `body` itself. Typed structurally for the same reason as
+ * {@link OpaqueFetch}; the hook contexts list the fields you are likely to
+ * touch and leave the rest open.
+ */
+export interface OpaqueFetchOptions {
+	headers?: Headers | Record<string, string> | [string, string][] | undefined;
+	query?: Record<string, unknown> | undefined;
+	signal?: AbortSignal | undefined;
+	credentials?: "omit" | "same-origin" | "include" | undefined;
+	onRequest?:
+		| ((context: { headers: Headers; [key: string]: unknown }) => unknown)
+		| undefined;
+	onResponse?:
+		| ((context: { response: Response; [key: string]: unknown }) => unknown)
+		| undefined;
+	onSuccess?:
+		| ((context: {
+				data: unknown;
+				response: Response;
+				[key: string]: unknown;
+		  }) => unknown)
+		| undefined;
+	onError?:
+		| ((context: {
+				error: OpaqueClientError;
+				response: Response;
+				[key: string]: unknown;
+		  }) => unknown)
+		| undefined;
+	[key: string]: unknown;
+}
 
 /**
  * Minimal structural view of better-auth's `$fetch`.
@@ -89,7 +123,8 @@ const fail = (
 });
 
 export const opaqueClient = (options: OpaqueClientOptions = {}) => {
-	const assertServerKey = (serverStaticPublicKey: string) =>
+	// True when a key is pinned and the server just proved a different one.
+	const serverKeyMismatch = (serverStaticPublicKey: string) =>
 		options.serverPublicKey !== undefined &&
 		options.serverPublicKey !== serverStaticPublicKey;
 
@@ -139,7 +174,7 @@ export const opaqueClient = (options: OpaqueClientOptions = {}) => {
 						password,
 						registrationResponse: challenge.data.challenge,
 					});
-				if (assertServerKey(serverStaticPublicKey)) {
+				if (serverKeyMismatch(serverStaticPublicKey)) {
 					return fail("SERVER_KEY_MISMATCH", 400, "BAD_REQUEST");
 				}
 				return {
@@ -277,7 +312,7 @@ export const opaqueClient = (options: OpaqueClientOptions = {}) => {
 							// proof, so this is decided entirely on the client.
 							return fail("INVALID_EMAIL_OR_PASSWORD", 401, "UNAUTHORIZED");
 						}
-						if (assertServerKey(login.serverStaticPublicKey)) {
+						if (serverKeyMismatch(login.serverStaticPublicKey)) {
 							return fail("SERVER_KEY_MISMATCH", 400, "BAD_REQUEST");
 						}
 						const result = await post<SignInComplete>(
@@ -370,8 +405,8 @@ export const opaqueClient = (options: OpaqueClientOptions = {}) => {
 							registrationResponse: challenge.data.registrationChallenge,
 						});
 						if (
-							assertServerKey(login.serverStaticPublicKey) ||
-							assertServerKey(registration.serverStaticPublicKey)
+							serverKeyMismatch(login.serverStaticPublicKey) ||
+							serverKeyMismatch(registration.serverStaticPublicKey)
 						) {
 							return fail("SERVER_KEY_MISMATCH", 400, "BAD_REQUEST");
 						}
@@ -506,6 +541,8 @@ export const opaqueClient = (options: OpaqueClientOptions = {}) => {
 								error: result.error ?? fail("INVALID_TOKEN", 400, "BAD_REQUEST").error,
 							};
 						}
+						// Every session was revoked server-side; drop the cached one.
+						$store.notify("$sessionSignal");
 						return {
 							data: {
 								...result.data,

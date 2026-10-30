@@ -1,6 +1,7 @@
 # Better Auth OPAQUE
 
 [![npm version](https://img.shields.io/npm/v/better-auth-opaque.svg)](https://www.npmjs.com/package/better-auth-opaque)
+[![CI](https://github.com/TheUntraceable/better-auth-opaque/actions/workflows/ci.yml/badge.svg)](https://github.com/TheUntraceable/better-auth-opaque/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A [Better Auth](https://better-auth.com) plugin that implements password authentication with the **OPAQUE** protocol ([RFC 9807](https://www.rfc-editor.org/rfc/rfc9807.html)).
@@ -32,7 +33,7 @@ bun add better-auth-opaque
 npm install better-auth-opaque
 ```
 
-Peer dependencies: `better-auth` 1.7 or newer and `zod` 4. `@serenity-kit/opaque` (the WebAssembly OPAQUE implementation) is installed automatically.
+Peer dependencies: `better-auth` 1.7 or newer and `zod` 4. `@serenity-kit/opaque` (the WebAssembly OPAQUE implementation) is installed automatically. The server plugin runs anywhere Better Auth does with a global Web Crypto API: Node 20+, Bun, and the edge runtimes.
 
 The plugin adds two columns to the `account` table, `registrationRecord` and `credentialId`. Run your Better Auth migration (`npx @better-auth/cli migrate` or `generate`) after installing.
 
@@ -91,6 +92,8 @@ All options:
 | `timingSafeResponseMs` | off | Minimum response time for the three endpoints whose work depends on whether an account exists. See [Security](#security). |
 | `insecureCreateSessionOnRegister` | `false` | Issue a session straight from sign-up. Makes sign-up an account-existence oracle. |
 
+`sendResetPassword`, `onExistingUserSignUp` and Better Auth's `sendVerificationEmail` run through Better Auth's background-task runner: detached when `advanced.backgroundTasks` is configured, awaited otherwise. An error thrown by any of them is logged and never returned to the client, because a 500 that only happens when the account exists would be an enumeration oracle. Watch your logs for mailer failures.
+
 ### 3. Client
 
 ```typescript
@@ -113,7 +116,7 @@ export const authClient = createAuthClient({
 
 ## Usage
 
-Every action returns `{ data, error }` like the rest of the Better Auth client, accepts an optional second `fetchOptions` argument, and refreshes `useSession` on success.
+Every action returns `{ data, error }` like the rest of the Better Auth client, accepts an optional second `fetchOptions` argument (`headers`, `query`, `signal`, `onSuccess`, `onError`, ... applied to every request of the flow), and refreshes `useSession` when the session changes.
 
 ### Sign up
 
@@ -249,7 +252,7 @@ All endpoints live under `/api/auth/opaque/` and are rate limited to 5 requests 
 | Reset password | `POST` | `/opaque/reset-password/challenge` | reset token |
 | Reset password | `POST` | `/opaque/reset-password/complete` | reset token |
 
-The `state` value each challenge returns is an encrypted, purpose-bound, single-use blob. The complete step must present it within `challengeExpiresIn` seconds.
+The `state` value each challenge returns is an encrypted, purpose-bound, single-use blob. The complete step must present it within `challengeExpiresIn` seconds. Each challenge also writes one row to Better Auth's `verification` table, which the complete step consumes; rows for abandoned challenges are purged with Better Auth's normal expired-verification cleanup.
 
 ## Security
 
@@ -261,7 +264,7 @@ The `state` value each challenge returns is an encrypted, purpose-bound, single-
 
 **Timing.** The matched-work design keeps the real and fake branches within tens of microseconds of each other, well under network jitter, which is the same approach Better Auth core takes for `/sign-in/email`. If your write path is much slower than your read path you can additionally set `timingSafeResponseMs` to pad the sign-in challenge, sign-up completion and reset request to a floor. Set it to roughly 2 to 3 times your p99 handler time. It is a backstop, not constant time: a request that overruns the floor leaks its real duration.
 
-**Handshake state.** The state blob handed to the client between the two steps is encrypted with the Better Auth secret, padded to a fixed size, bound to its purpose (sign-in state cannot complete a password change), expires after `challengeExpiresIn` seconds, and can be completed exactly once. A challenge minted before a password change cannot complete after it.
+**Handshake state.** The state blob handed to the client between the two steps is encrypted with the Better Auth secret, padded to a fixed size, bound to its purpose (sign-in state cannot complete a password change), expires after `challengeExpiresIn` seconds, and can be completed exactly once. Consumption is atomic (Better Auth's `consumeVerificationValue`), so concurrent requests carrying the same state, or the same reset token, cannot both succeed. A challenge minted before a password change cannot complete after it.
 
 **Email changes.** Records are bound to a server-generated credential id, not the email, so `changeEmail` and case differences in the typed email do not lock anyone out.
 
@@ -290,13 +293,17 @@ The `state` value each challenge returns is an encrypted, purpose-bound, single-
 
 ```bash
 bun install
+bun run typecheck    # tsc over src/ and tests/ (the type-level tests only bite here)
 bun run build        # tsc -> dist/
 bun run test         # vitest on better-auth's HTTP test instance, run under bun
+bun run check        # all three, which is also what CI and prepublishOnly run
 bun run test:timing  # opt-in statistical timing tests (slow)
 bun run test:server  # manual Express server on :8080
 ```
 
 Tests use `better-auth/test`, which needs `node:sqlite` with `StatementSync.columns()`. That ships in Bun and in Node 22.16+/23.11+; `bun run test:node` runs the suite on plain Node if yours is new enough.
+
+Releases: publishing a GitHub release runs the `release` workflow, which re-runs `bun run check` and publishes to npm with provenance. It needs an npm automation token in the `NPM_TOKEN` repository secret.
 
 ## License
 
