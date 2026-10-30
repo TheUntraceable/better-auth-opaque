@@ -28,7 +28,7 @@
 		"build": "tsc",
 		"prepublishOnly": "npm run build && npm test",
 		"test": "bunx --bun vitest run",
-		"test:timing": "cross-env OPAQUE_TIMING_TESTS=1 bunx --bun vitest run tests/timing",
+		"test:timing": "cross-env OPAQUE_TIMING_TESTS=1 bunx --bun vitest run tests/timing/ --no-file-parallelism",
 		"test:server": "bun tests/server.ts",
 		"test:node": "vitest run"
 	},

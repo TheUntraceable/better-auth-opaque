@@ -43,8 +43,10 @@ describe("enumeration defences", () => {
 				body: { email, loginRequest: startLoginRequest },
 			});
 		const [a, b] = await Promise.all([post(), post()]);
-		// The evaluated element is the first 32 bytes (43 chars) of the response.
-		expect(a.data?.challenge.slice(0, 43)).toBe(b.data?.challenge.slice(0, 43));
+		// The evaluated element is the first 32 bytes of the response. 42 base64url
+		// chars cover 252 of those bits; the 43rd char already mixes in the random
+		// masking nonce.
+		expect(a.data?.challenge.slice(0, 42)).toBe(b.data?.challenge.slice(0, 42));
 	});
 
 	test("timingSafeResponseMs pads the existence-dependent endpoints", async () => {
