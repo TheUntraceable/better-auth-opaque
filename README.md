@@ -79,7 +79,7 @@ export const auth = betterAuth({
 });
 ```
 
-All options are listed in [docs/reference.md](docs/reference.md#options).
+All options, endpoints and error codes are listed in [docs/reference.md](docs/reference.md).
 
 `sendResetPassword`, `onExistingUserSignUp`, `onSessionKey` and Better Auth's `sendVerificationEmail` run through Better Auth's background-task runner: detached when `advanced.backgroundTasks` is configured, awaited otherwise. An error thrown by any of them is logged and never returned to the client, because a 500 that only happens when the account exists would be an enumeration oracle. Watch your logs for mailer failures.
 
@@ -164,7 +164,9 @@ const { data, error } = await authClient.opaque.changePassword({
 // data.exportKey         -> the key for the NEW password
 ```
 
-Requires a fresh session, one created within Better Auth's `session.freshAge` (default one day); otherwise the action fails with 403 `SESSION_NOT_FRESH`. The current password is proven with a full OPAQUE login before anything changes.
+Requires a fresh session (within Better Auth's `session.freshAge`, default one day), else it fails with 403 `SESSION_NOT_FRESH`. The current password is proven with a full OPAQUE login before anything changes.
+
+If the complete request fails after the server stored the new record (a dropped connection, say), the action returns only the error. Signing in with the new password recovers the new export key, but the previous one cannot be re-derived, so keep the previous key until data wrapped under it is confirmed re-wrapped under the new key.
 
 ### Set a password on an account that has none
 
@@ -195,7 +197,7 @@ const { data, error } = await authClient.opaque.resetPassword({
 
 ### Using the export key
 
-The export key is the reason to use OPAQUE over bcrypt. It is a 64-byte secret that only the client ever holds, stable until the password is changed, set or reset, even to the same value. A typical pattern:
+The export key is the reason to use OPAQUE over bcrypt. A typical pattern:
 
 ```typescript
 // On sign-up: make a random data key, wrap it with a key derived from exportKey
@@ -217,10 +219,6 @@ Two rules follow from this:
 
 * **Never send the export key to the server.** The plugin does not, and your code should not either.
 * **A password reset produces a new export key and the old one is gone.** Anything wrapped only under the old key is unrecoverable. If you build client-side encryption, give users a recovery key or re-wrap the data key from a signed-in session before they lose access.
-
-## Reference
-
-[docs/reference.md](docs/reference.md) lists every [option](docs/reference.md#options), [endpoint](docs/reference.md#endpoints) and [error code](docs/reference.md#error-codes).
 
 ## Security
 
@@ -270,9 +268,9 @@ bun run test:timing  # opt-in statistical timing tests (slow)
 bun run test:server  # manual Express server on :8080
 ```
 
-Tests use `better-auth/test`, which needs `node:sqlite` with `StatementSync.columns()`. That ships in Bun and in Node 22.16+/23.11+; `bun run test:node` runs the suite on plain Node if yours is new enough.
+Tests use `better-auth/test`, which needs `node:sqlite` with `StatementSync.columns()`. That ships in Bun and in Node 22.16+/23.11+; `bun run test:node` runs the suite on plain Node.
 
-Releases: publishing a GitHub release runs the `release` workflow in the `release` environment. It checks that the tag matches the `package.json` version, runs `bun run check` once, then publishes to npm with provenance and `--ignore-scripts`. It needs an npm token in the `NPM_TOKEN` secret.
+Releases: publishing a GitHub release runs the `release` workflow in the `release` environment. It checks the tag against the `package.json` version, then publishes to npm with provenance and `--ignore-scripts`. `NPM_TOKEN` must be a granular access token with read and write access to this package and 2FA bypass enabled, since the workflow cannot enter a one-time password.
 
 ## License
 

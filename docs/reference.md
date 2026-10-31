@@ -20,7 +20,7 @@
 
 ## Endpoints
 
-All endpoints live under `/api/auth/opaque/` and are rate limited per IP and path: the reset-password request to 3 per 60 seconds, each `*/challenge` endpoint to 3 per 10 seconds, everything else to 5 per 10 seconds. The `rateLimit` option replaces all three with one rule; Better Auth's `rateLimit.customRules` override both. Like every Better Auth limit, they apply only while Better Auth's rate limiter is enabled, which by default is in production only. The two-step flows are driven by the client plugin; call them directly only if you are writing your own client.
+All endpoints live under `/api/auth/opaque/` and are rate limited per IP and path: the reset-password request to 3 per 60 seconds, each `*/challenge` endpoint to 3 per 10 seconds, everything else to 5 per 10 seconds. Better Auth reads the client IP from `x-forwarded-for` (or `advanced.ipAddress.ipAddressHeaders`); when it finds no usable IP, as with a multi-hop header and no `advanced.ipAddress.trustedProxies`, every client shares one bucket per path, so any three reset requests within 60 seconds block reset requests for everyone until the window ends. The `rateLimit` option replaces all three with one rule; Better Auth's `rateLimit.customRules` override both. Like every Better Auth limit, they apply only while Better Auth's rate limiter is enabled, which by default is in production only. The two-step flows are driven by the client plugin; call them directly only if you are writing your own client.
 
 | Flow | Method | Path | Auth |
 | :-- | :-- | :-- | :-- |

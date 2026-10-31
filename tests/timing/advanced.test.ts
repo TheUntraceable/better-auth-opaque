@@ -1,12 +1,10 @@
 import { client as opaqueCrypto, ready } from "@serenity-kit/opaque";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { createOpaqueTestInstance } from "../helpers";
+import { createOpaqueTestInstance, type OpaqueTestInstance } from "../helpers";
 
-describe.skipIf(!process.env.OPAQUE_TIMING_TESTS)("advanced timing attack resistance", async () => {
-	await ready;
-
-	const { client, server } = await createOpaqueTestInstance();
-	afterAll(() => server.close());
+describe.skipIf(!process.env.OPAQUE_TIMING_TESTS)("advanced timing attack resistance", () => {
+	let client: OpaqueTestInstance["client"];
+	let server: OpaqueTestInstance["server"];
 
 	const existingUserEmail = "advanced-timing-existing@untraceable.dev";
 	const nonExistentUserEmail = "advanced-timing-nonexistent@untraceable.dev";
@@ -18,8 +16,11 @@ describe.skipIf(!process.env.OPAQUE_TIMING_TESTS)("advanced timing attack resist
 	const keyStretching = { "argon2id-custom": { iterations: 1, memory: 8, parallelism: 1 } } as const;
 
 	beforeAll(async () => {
+		await ready;
+		({ client, server } = await createOpaqueTestInstance());
 		await client.signUp.opaque({ email: existingUserEmail, name: testName, password: testPassword });
 	});
+	afterAll(() => server.close());
 
 	const prepareSignUp = async (email: string) => {
 		const { clientRegistrationState, registrationRequest } =
