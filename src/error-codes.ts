@@ -25,6 +25,7 @@ export const OPAQUE_ERROR_CODES = defineCodes({
 	SERVER_KEY_MISMATCH:
 		"The server's OPAQUE public key does not match the pinned key",
 	CHALLENGE_FAILED: "Failed to obtain a challenge from the server",
+	REQUEST_FAILED: "The server answered without the data this step needs",
 });
 
 export type OpaqueErrorCode = keyof typeof OPAQUE_ERROR_CODES;

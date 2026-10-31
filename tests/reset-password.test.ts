@@ -174,10 +174,12 @@ describe("opaque: password reset", () => {
 			await scoped.client.opaque.requestPasswordReset({ email });
 			// The challenge does not consume the token, so both calls pass it and
 			// the loser fails at complete, where the client decides to notify.
+			const failedPaths: string[] = [];
 			const results = await Promise.all(
 				["signal-password-a", "signal-password-b"].map((newPassword) =>
 					scoped.client.opaque.resetPassword(
 						{ token: tokens[0]!, newPassword },
+						{ onError: ({ request }) => void failedPaths.push(String(request.url)) },
 					),
 				),
 			);
@@ -185,6 +187,8 @@ describe("opaque: password reset", () => {
 			const failed = results.filter((r) => r.error !== null);
 			expect(failed).toHaveLength(1);
 			expect(failed[0]!.error?.code).toBe("INVALID_TOKEN");
+			expect(failedPaths).toHaveLength(1);
+			expect(failedPaths[0]).toMatch(/\/opaque\/reset-password\/complete$/);
 			expect(notified).toBe(1);
 		} finally {
 			unlisten();
