@@ -3,14 +3,14 @@ import {
 	server as opaqueServer,
 	ready,
 } from "@serenity-kit/opaque";
+import { makeSignature } from "better-auth/crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { fakeCredentialId } from "../src/server/account";
 import {
 	createOpaqueTestInstance,
 	type OpaqueTestInstance,
-	TEST_OPAQUE_SERVER_KEY,
 	uniqueEmail,
 } from "./helpers";
+import { TEST_OPAQUE_SERVER_KEY } from "./test-key";
 
 // Deterministic checks on the enumeration defences. The statistical timing
 // tests live in tests/timing and are opt-in (OPAQUE_TIMING_TESTS=1).
@@ -71,7 +71,10 @@ describe("enumeration defences", () => {
 			// Computed without the auth secret, so rotating it cannot move these.
 			const expected = opaqueServer.startLogin({
 				serverSetup: TEST_OPAQUE_SERVER_KEY,
-				userIdentifier: await fakeCredentialId(TEST_OPAQUE_SERVER_KEY, email),
+				userIdentifier: await makeSignature(
+					`better-auth-opaque:fake-credential:${email}`,
+					TEST_OPAQUE_SERVER_KEY,
+				),
 				registrationRecord: null,
 				startLoginRequest,
 			}).loginResponse;

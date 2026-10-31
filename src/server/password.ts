@@ -1,11 +1,9 @@
-import { server } from "@serenity-kit/opaque";
-import { APIError } from "better-auth";
+import { APIError, generateId } from "better-auth";
 import {
 	createAuthEndpoint,
 	freshSessionMiddleware,
 	sensitiveSessionMiddleware,
 } from "better-auth/api";
-import { generateRandomString } from "better-auth/crypto";
 import { parseUserOutput } from "better-auth/db";
 import * as z from "zod";
 import { OPAQUE_ERROR_CODES } from "../error-codes";
@@ -14,7 +12,7 @@ import {
 	findOpaqueAccount,
 	loginIdentity,
 	matchesLoginIdentity,
-	saveOpaqueRecord,
+	upsertOpaqueAccount,
 } from "./account";
 import {
 	loginRequest,
@@ -35,7 +33,14 @@ const freshSensitiveSession = [
 ];
 
 export const passwordEndpoints = (shared: Shared) => {
-	const { issueState, consumeState, finishLogin, issueSession } = shared;
+	const {
+		issueState,
+		consumeState,
+		startLogin,
+		createRegistrationResponse,
+		finishLogin,
+		issueSession,
+	} = shared;
 
 	return {
 		opaqueChangePasswordChallenge: createAuthEndpoint(
@@ -57,7 +62,7 @@ export const passwordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const user = ctx.context.session.user;
+				const { user } = ctx.context.session;
 				const account = await findOpaqueAccount(ctx, user.id);
 				if (!account?.registrationRecord) {
 					throw APIError.from(
@@ -72,16 +77,14 @@ export const passwordEndpoints = (shared: Shared) => {
 					account.registrationRecord,
 					user.email,
 				);
-				const newCredentialId = generateRandomString(32);
+				const newCredentialId = generateId();
 
-				const { loginResponse, serverLoginState } = server.startLogin({
-					serverSetup: shared.serverSetup,
+				const { loginResponse, serverLoginState } = startLogin({
 					userIdentifier: identity.credentialId,
 					registrationRecord: account.registrationRecord,
 					startLoginRequest: ctx.body.loginRequest,
 				});
-				const { registrationResponse } = server.createRegistrationResponse({
-					serverSetup: shared.serverSetup,
+				const registrationResponse = createRegistrationResponse({
 					userIdentifier: newCredentialId,
 					registrationRequest: ctx.body.registrationRequest,
 				});
@@ -121,20 +124,20 @@ export const passwordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const sessionUser = ctx.context.session.user;
+				const { user, session } = ctx.context.session;
 				const decoded = await consumeState(
 					ctx,
 					ctx.body.state,
 					PURPOSE.changePassword,
 				);
-				if (decoded.userId !== sessionUser.id) {
+				if (decoded.userId !== user.id) {
 					throw APIError.from(
 						"UNAUTHORIZED",
 						OPAQUE_ERROR_CODES.USER_MISMATCH,
 					);
 				}
-				const account = await findOpaqueAccount(ctx, sessionUser.id);
-				if (!account || !(await matchesLoginIdentity(account, decoded))) {
+				const account = await findOpaqueAccount(ctx, user.id);
+				if (!(await matchesLoginIdentity(account, decoded))) {
 					throw APIError.from(
 						"BAD_REQUEST",
 						OPAQUE_ERROR_CODES.INVALID_LOGIN_STATE,
@@ -145,38 +148,26 @@ export const passwordEndpoints = (shared: Shared) => {
 					decoded.serverLoginState,
 					OPAQUE_ERROR_CODES.INVALID_PASSWORD,
 				);
-				await assertValidRegistrationRecord(
+				assertValidRegistrationRecord(
 					shared.serverSetup,
 					decoded.newCredentialId,
 					ctx.body.registrationRecord,
 				);
-				await saveOpaqueRecord(ctx, account, {
-					userId: sessionUser.id,
+				const revokeOtherSessions = ctx.body.revokeOtherSessions !== false;
+				// Revoked before the write, as core does: a revoke failing after it
+				// would leave old sessions alive under the new password.
+				if (revokeOtherSessions) {
+					await ctx.context.internalAdapter.deleteUserSessions(user.id);
+				}
+				await upsertOpaqueAccount(ctx, account, {
+					userId: user.id,
 					registrationRecord: ctx.body.registrationRecord,
 					credentialId: decoded.newCredentialId,
 				});
-
-				const user = await ctx.context.internalAdapter.findUserById(
-					sessionUser.id,
-				);
-				if (!user) {
-					throw APIError.from(
-						"UNAUTHORIZED",
-						OPAQUE_ERROR_CODES.USER_MISMATCH,
-					);
-				}
-				if (ctx.body.revokeOtherSessions !== false) {
-					await ctx.context.internalAdapter.deleteUserSessions(user.id);
-					const session = await issueSession(ctx, user, false);
-					return {
-						token: session.token,
-						user: parseUserOutput(ctx.context.options, user),
-					};
-				}
-				return {
-					token: ctx.context.session.session.token,
-					user: parseUserOutput(ctx.context.options, user),
-				};
+				const token = revokeOtherSessions
+					? (await issueSession(ctx, user, false)).token
+					: session.token;
+				return { token, user: parseUserOutput(ctx.context.options, user) };
 			},
 		),
 
@@ -196,7 +187,7 @@ export const passwordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const user = ctx.context.session.user;
+				const { user } = ctx.context.session;
 				const account = await findOpaqueAccount(ctx, user.id);
 				if (account?.registrationRecord) {
 					throw APIError.from(
@@ -204,9 +195,8 @@ export const passwordEndpoints = (shared: Shared) => {
 						OPAQUE_ERROR_CODES.OPAQUE_ACCOUNT_EXISTS,
 					);
 				}
-				const newCredentialId = generateRandomString(32);
-				const { registrationResponse } = server.createRegistrationResponse({
-					serverSetup: shared.serverSetup,
+				const newCredentialId = generateId();
+				const challenge = createRegistrationResponse({
 					userIdentifier: newCredentialId,
 					registrationRequest: ctx.body.registrationRequest,
 				});
@@ -215,7 +205,7 @@ export const passwordEndpoints = (shared: Shared) => {
 					userId: user.id,
 					newCredentialId,
 				});
-				return { challenge: registrationResponse, state: encrypted };
+				return { challenge, state: encrypted };
 			},
 		),
 
@@ -234,7 +224,7 @@ export const passwordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const user = ctx.context.session.user;
+				const { user } = ctx.context.session;
 				const decoded = await consumeState(
 					ctx,
 					ctx.body.state,
@@ -246,7 +236,7 @@ export const passwordEndpoints = (shared: Shared) => {
 						OPAQUE_ERROR_CODES.USER_MISMATCH,
 					);
 				}
-				await assertValidRegistrationRecord(
+				assertValidRegistrationRecord(
 					shared.serverSetup,
 					decoded.newCredentialId,
 					ctx.body.registrationRecord,
@@ -258,7 +248,7 @@ export const passwordEndpoints = (shared: Shared) => {
 						OPAQUE_ERROR_CODES.OPAQUE_ACCOUNT_EXISTS,
 					);
 				}
-				await saveOpaqueRecord(ctx, existing, {
+				await upsertOpaqueAccount(ctx, existing, {
 					userId: user.id,
 					registrationRecord: ctx.body.registrationRecord,
 					credentialId: decoded.newCredentialId,

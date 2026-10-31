@@ -1,7 +1,5 @@
-import { server } from "@serenity-kit/opaque";
-import { APIError } from "better-auth";
+import { APIError, generateId } from "better-auth";
 import { createAuthEndpoint, sendVerificationEmailFn } from "better-auth/api";
-import { generateRandomString } from "better-auth/crypto";
 import { parseUserOutput } from "better-auth/db";
 import * as z from "zod";
 import { OPAQUE_ERROR_CODES } from "../error-codes";
@@ -13,6 +11,7 @@ import {
 	matchesLoginIdentity,
 } from "./account";
 import {
+	emailAddress,
 	enforceMinimumDuration,
 	loginRequest,
 	loginResult,
@@ -28,9 +27,9 @@ export const signInEndpoints = (shared: Shared) => {
 		issueState,
 		consumeState,
 		runHook,
+		startLogin,
 		finishLogin,
 		issueSession,
-		floorMs,
 	} = shared;
 
 	return {
@@ -39,7 +38,7 @@ export const signInEndpoints = (shared: Shared) => {
 			{
 				method: "POST",
 				body: z.object({
-					email: z.email(),
+					email: emailAddress,
 					loginRequest,
 				}),
 				metadata: {
@@ -60,7 +59,7 @@ export const signInEndpoints = (shared: Shared) => {
 					// A random id on the missing branch keeps the query count the same.
 					const account = await findOpaqueAccount(
 						ctx,
-						found?.user.id ?? generateRandomString(32),
+						found?.user.id ?? generateId(),
 					);
 					const record = account?.registrationRecord ?? null;
 					// A null record makes the library simulate a registered user; the
@@ -73,8 +72,7 @@ export const signInEndpoints = (shared: Shared) => {
 									credentialId: await fakeCredentialId(shared.serverSetup, email),
 								};
 
-					const { loginResponse, serverLoginState } = server.startLogin({
-						serverSetup: shared.serverSetup,
+					const { loginResponse, serverLoginState } = startLogin({
 						userIdentifier: identity.credentialId,
 						registrationRecord: record,
 						startLoginRequest: ctx.body.loginRequest,
@@ -87,7 +85,7 @@ export const signInEndpoints = (shared: Shared) => {
 					});
 					return { challenge: loginResponse, state: encrypted };
 				} finally {
-					await enforceMinimumDuration(started, floorMs);
+					await enforceMinimumDuration(started, options.timingSafeResponseMs);
 				}
 			},
 		),

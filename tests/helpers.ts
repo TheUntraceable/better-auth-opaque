@@ -6,8 +6,6 @@ import { opaqueClient, type OpaqueClientOptions } from "../src/client";
 import { opaque, type OpaqueOptions } from "../src/server";
 import { TEST_OPAQUE_SERVER_KEY } from "./test-key";
 
-export { TEST_OPAQUE_SERVER_KEY } from "./test-key";
-
 export const TEST_OPAQUE_PUBLIC_KEY = () =>
 	server.getPublicKey(TEST_OPAQUE_SERVER_KEY);
 

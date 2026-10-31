@@ -1,15 +1,14 @@
-import { server } from "@serenity-kit/opaque";
-import { APIError } from "better-auth";
+import { APIError, generateId } from "better-auth";
 import { createAuthEndpoint, originCheck } from "better-auth/api";
-import { generateRandomString } from "better-auth/crypto";
 import * as z from "zod";
 import { OPAQUE_ERROR_CODES } from "../error-codes";
 import {
 	assertValidRegistrationRecord,
 	findOpaqueAccount,
-	saveOpaqueRecord,
+	upsertOpaqueAccount,
 } from "./account";
 import {
+	emailAddress,
 	enforceMinimumDuration,
 	normalizeEmail,
 	registrationRecord,
@@ -19,11 +18,20 @@ import {
 } from "./shared";
 import { PURPOSE } from "./state";
 
+const DEFAULT_RESET_PASSWORD_TOKEN_EXPIRES_IN = 60 * 60;
+const MAX_RESET_TOKEN_CHARS = 256;
+
+const resetToken = z.string().min(1).max(MAX_RESET_TOKEN_CHARS);
 const resetIdentifier = (token: string) => `opaque-reset:${token}`;
 
 export const resetPasswordEndpoints = (shared: Shared) => {
-	const { options, issueState, consumeState, runHook, resetTtlMs, floorMs } =
-		shared;
+	const {
+		options,
+		issueState,
+		consumeState,
+		runHook,
+		createRegistrationResponse,
+	} = shared;
 
 	return {
 		opaqueRequestPasswordReset: createAuthEndpoint(
@@ -31,7 +39,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 			{
 				method: "POST",
 				body: z.object({
-					email: z.email(),
+					email: emailAddress,
 					redirectTo: z.string().optional(),
 				}),
 				use: [originCheck((ctx) => ctx.body.redirectTo)],
@@ -68,11 +76,14 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 						);
 						return { status: true };
 					}
-					const token = generateRandomString(32);
+					const token = generateId();
+					const expiresIn =
+						options.resetPasswordTokenExpiresIn ??
+						DEFAULT_RESET_PASSWORD_TOKEN_EXPIRES_IN;
 					await ctx.context.internalAdapter.createVerificationValue({
 						identifier: resetIdentifier(token),
 						value: found.user.id,
-						expiresAt: new Date(Date.now() + resetTtlMs),
+						expiresAt: new Date(Date.now() + expiresIn * 1000),
 					});
 					const callbackURL = encodeURIComponent(ctx.body.redirectTo ?? "");
 					const url = `${ctx.context.baseURL}/opaque/reset-password/${token}?callbackURL=${callbackURL}`;
@@ -82,7 +93,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 					);
 					return { status: true };
 				} finally {
-					await enforceMinimumDuration(started, floorMs);
+					await enforceMinimumDuration(started, options.timingSafeResponseMs);
 				}
 			},
 		),
@@ -125,7 +136,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 			{
 				method: "POST",
 				body: z.object({
-					token: z.string().min(1).max(256),
+					token: resetToken,
 					registrationRequest,
 				}),
 				metadata: {
@@ -144,9 +155,8 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				if (!verification || verification.expiresAt < new Date()) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
-				const newCredentialId = generateRandomString(32);
-				const { registrationResponse } = server.createRegistrationResponse({
-					serverSetup: shared.serverSetup,
+				const newCredentialId = generateId();
+				const challenge = createRegistrationResponse({
 					userIdentifier: newCredentialId,
 					registrationRequest: ctx.body.registrationRequest,
 				});
@@ -156,7 +166,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 					newCredentialId,
 					token: ctx.body.token,
 				});
-				return { challenge: registrationResponse, state: encrypted };
+				return { challenge, state: encrypted };
 			},
 		),
 
@@ -165,7 +175,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 			{
 				method: "POST",
 				body: z.object({
-					token: z.string().min(1).max(256),
+					token: resetToken,
 					registrationRecord,
 					state,
 				}),
@@ -200,7 +210,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				if (!user) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
-				await assertValidRegistrationRecord(
+				assertValidRegistrationRecord(
 					shared.serverSetup,
 					decoded.newCredentialId,
 					ctx.body.registrationRecord,
@@ -216,12 +226,14 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
-				await saveOpaqueRecord(ctx, await findOpaqueAccount(ctx, user.id), {
+				// Revoked before the write, as core does: a revoke failing after it
+				// would leave pre-reset sessions alive under the new password.
+				await ctx.context.internalAdapter.deleteUserSessions(user.id);
+				await upsertOpaqueAccount(ctx, await findOpaqueAccount(ctx, user.id), {
 					userId: user.id,
 					registrationRecord: ctx.body.registrationRecord,
 					credentialId: decoded.newCredentialId,
 				});
-				await ctx.context.internalAdapter.deleteUserSessions(user.id);
 				return { status: true };
 			},
 		),

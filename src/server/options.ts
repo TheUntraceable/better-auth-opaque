@@ -3,7 +3,7 @@ import type { GenericEndpointContext, Session, User } from "better-auth";
 export interface OpaqueOptions {
 	/**
 	 * The OPAQUE server setup, generated once with
-	 * `import { server } from "@serenity-kit/opaque"; server.createSetup()`.
+	 * `npx @serenity-kit/opaque@0.9 create-server-setup`.
 	 *
 	 * Every registration record is bound to this value. Rotating it
 	 * invalidates every password; losing it locks every user out.

@@ -5,9 +5,9 @@ import {
 	createOpaqueTestInstance,
 	password,
 	TEST_OPAQUE_PUBLIC_KEY,
-	TEST_OPAQUE_SERVER_KEY,
 	uniqueEmail,
 } from "./helpers";
+import { TEST_OPAQUE_SERVER_KEY } from "./test-key";
 
 // init only reads these two fields of the auth context.
 const initContext = () => ({ logger: { warn: vi.fn() }, options: {} });
@@ -36,12 +36,40 @@ describe("opaque: server setup", () => {
 		}
 	});
 
-	test("generates a temporary key when NODE_ENV is test", async () => {
-		const ctx = initContext();
-		await opaque().init(ctx as never);
-		expect(ctx.logger.warn).toHaveBeenCalledWith(
-			expect.stringContaining("temporary key"),
+	test("generates a working temporary key when NODE_ENV is test", async () => {
+		const warnings: string[] = [];
+		const t = await createOpaqueTestInstance(
+			{ serverSetup: undefined },
+			{
+				logger: {
+					level: "warn",
+					log: (level, message) => {
+						if (level === "warn") warnings.push(message);
+					},
+				},
+			},
 		);
+		try {
+			const email = uniqueEmail("temporary");
+			const signUp = await t.client.signUp.opaque({
+				email,
+				name: "Temporary",
+				password,
+			});
+			// Creating the instance does not wait for plugin init; serving a
+			// request does.
+			expect(warnings).toEqual(
+				expect.arrayContaining([expect.stringContaining("temporary key")]),
+			);
+			expect(signUp.error).toBeNull();
+			expect(signUp.data?.serverPublicKey).not.toBe(TEST_OPAQUE_PUBLIC_KEY());
+			const signIn = await t.client.signIn.opaque({ email, password });
+			expect(signIn.error).toBeNull();
+			expect(signIn.data?.token).toBeTruthy();
+			expect(signIn.data?.exportKey).toBe(signUp.data?.exportKey);
+		} finally {
+			await t.server.close();
+		}
 	});
 
 	test("refuses to start without a key outside development and test", async () => {

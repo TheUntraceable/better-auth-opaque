@@ -1,15 +1,16 @@
-import { client, ready, server } from "@serenity-kit/opaque";
-import { APIError, type GenericEndpointContext } from "better-auth";
+import { client, server } from "@serenity-kit/opaque";
+import {
+	type Account,
+	APIError,
+	type GenericEndpointContext,
+} from "better-auth";
+import { makeSignature } from "better-auth/crypto";
 import { OPAQUE_ERROR_CODES } from "../error-codes";
 
-export interface OpaqueAccount {
-	id: string;
-	userId: string;
-	providerId: string;
+type OpaqueAccount = Account & {
 	registrationRecord?: string | null;
 	credentialId?: string | null;
-	[key: string]: unknown;
-}
+};
 
 export async function findOpaqueAccount(
 	ctx: GenericEndpointContext,
@@ -21,18 +22,10 @@ export async function findOpaqueAccount(
 	return accounts.find((account) => account.providerId === "opaque");
 }
 
-const encoder = new TextEncoder();
-
-function toBase64Url(bytes: ArrayBuffer): string {
-	let binary = "";
-	for (const byte of new Uint8Array(bytes)) {
-		binary += String.fromCharCode(byte);
-	}
-	return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-const digest = async (value: string) =>
-	toBase64Url(await crypto.subtle.digest("SHA-256", encoder.encode(value)));
+// Only compared against a value the server itself put in an encrypted
+// state, so the key needs no secrecy.
+const recordDigest = (registrationRecord: string) =>
+	makeSignature(registrationRecord, "better-auth-opaque:legacy-record");
 
 /** The identifier a login challenge was computed under, carried in its state. */
 export interface LoginIdentity {
@@ -54,7 +47,7 @@ export async function loginIdentity(
 	if (account.credentialId) return { credentialId: account.credentialId };
 	return {
 		credentialId: email,
-		legacyRecordDigest: await digest(registrationRecord),
+		legacyRecordDigest: await recordDigest(registrationRecord),
 	};
 }
 
@@ -75,7 +68,8 @@ export async function matchesLoginIdentity(
 		);
 	}
 	return (
-		identity.legacyRecordDigest === (await digest(account.registrationRecord))
+		identity.legacyRecordDigest ===
+		(await recordDigest(account.registrationRecord))
 	);
 }
 
@@ -88,47 +82,35 @@ export async function matchesLoginIdentity(
  * already determines every real evaluation: keyed on the auth secret,
  * rotating that secret would change the answers for unknown emails only.
  */
-export async function fakeCredentialId(
+export function fakeCredentialId(
 	serverSetup: string,
 	email: string,
 ): Promise<string> {
-	const key = await crypto.subtle.importKey(
-		"raw",
-		encoder.encode(serverSetup),
-		{ name: "HMAC", hash: "SHA-256" },
-		false,
-		["sign"],
+	return makeSignature(
+		`better-auth-opaque:fake-credential:${email}`,
+		serverSetup,
 	);
-	const sig = await crypto.subtle.sign(
-		"HMAC",
-		key,
-		encoder.encode(`better-auth-opaque:fake-credential:${email}`),
-	);
-	return toBase64Url(sig);
 }
-
-let dummyLoginRequest: string | undefined;
 
 /**
  * Checks that a client-supplied registration record deserialises and can
  * start a login under the given credential identifier. Without this a
  * malformed record would be persisted and every later login would crash.
  */
-export async function assertValidRegistrationRecord(
+export function assertValidRegistrationRecord(
 	serverSetup: string,
 	credentialId: string,
 	registrationRecord: string,
-): Promise<void> {
-	await ready;
-	dummyLoginRequest ??= client.startLogin({
+): void {
+	const { startLoginRequest } = client.startLogin({
 		password: "record-validation",
-	}).startLoginRequest;
+	});
 	try {
 		server.startLogin({
 			serverSetup,
 			userIdentifier: credentialId,
 			registrationRecord,
-			startLoginRequest: dummyLoginRequest,
+			startLoginRequest,
 		});
 	} catch {
 		throw APIError.from(
@@ -138,8 +120,7 @@ export async function assertValidRegistrationRecord(
 	}
 }
 
-// The plugin's account fields are not in core's account type, hence the casts.
-export async function saveOpaqueRecord(
+export async function upsertOpaqueAccount(
 	ctx: GenericEndpointContext,
 	existing: OpaqueAccount | undefined,
 	data: { userId: string; registrationRecord: string; credentialId: string },
@@ -150,10 +131,8 @@ export async function saveOpaqueRecord(
 		credentialId: data.credentialId,
 	};
 	if (existing) {
-		await internalAdapter.updateAccount(
-			existing.id,
-			fields as Parameters<typeof internalAdapter.updateAccount>[1],
-		);
+		// updateAccount is typed to core's columns only.
+		await internalAdapter.updateAccount(existing.id, fields as Partial<Account>);
 		return;
 	}
 	await internalAdapter.createAccount({
@@ -161,5 +140,5 @@ export async function saveOpaqueRecord(
 		accountId: data.userId,
 		userId: data.userId,
 		...fields,
-	} as Parameters<typeof internalAdapter.createAccount>[0]);
+	});
 }

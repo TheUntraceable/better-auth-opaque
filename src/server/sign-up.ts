@@ -1,12 +1,11 @@
-import { server } from "@serenity-kit/opaque";
-import { APIError, type User } from "better-auth";
+import { APIError, generateId, type User } from "better-auth";
 import { createAuthEndpoint, sendVerificationEmailFn } from "better-auth/api";
-import { generateRandomString } from "better-auth/crypto";
 import { parseUserInput } from "better-auth/db";
 import * as z from "zod";
 import { OPAQUE_ERROR_CODES } from "../error-codes";
-import { assertValidRegistrationRecord, saveOpaqueRecord } from "./account";
+import { assertValidRegistrationRecord } from "./account";
 import {
+	emailAddress,
 	enforceMinimumDuration,
 	normalizeEmail,
 	registrationRecord,
@@ -16,9 +15,17 @@ import {
 } from "./shared";
 import { PURPOSE } from "./state";
 
+const MAX_NAME_LENGTH = 100;
+
 export const signUpEndpoints = (shared: Shared) => {
-	const { options, issueState, consumeState, runHook, issueSession, floorMs } =
-		shared;
+	const {
+		options,
+		issueState,
+		consumeState,
+		runHook,
+		issueSession,
+		createRegistrationResponse,
+	} = shared;
 
 	return {
 		opaqueSignUpChallenge: createAuthEndpoint(
@@ -26,7 +33,7 @@ export const signUpEndpoints = (shared: Shared) => {
 			{
 				method: "POST",
 				body: z.object({
-					email: z.email(),
+					email: emailAddress,
 					registrationRequest,
 				}),
 				metadata: {
@@ -41,9 +48,8 @@ export const signUpEndpoints = (shared: Shared) => {
 				const email = normalizeEmail(ctx.body.email);
 				// No lookup here: the challenge does not depend on whether the
 				// account exists, so there is nothing to hide.
-				const credentialId = generateRandomString(32);
-				const { registrationResponse } = server.createRegistrationResponse({
-					serverSetup: shared.serverSetup,
+				const credentialId = generateId();
+				const challenge = createRegistrationResponse({
 					userIdentifier: credentialId,
 					registrationRequest: ctx.body.registrationRequest,
 				});
@@ -52,7 +58,7 @@ export const signUpEndpoints = (shared: Shared) => {
 					email,
 					credentialId,
 				});
-				return { challenge: registrationResponse, state: encrypted };
+				return { challenge, state: encrypted };
 			},
 		),
 
@@ -62,8 +68,8 @@ export const signUpEndpoints = (shared: Shared) => {
 				method: "POST",
 				body: z
 					.object({
-						email: z.email(),
-						name: z.string().min(1).max(100),
+						email: emailAddress,
+						name: z.string().min(1).max(MAX_NAME_LENGTH),
 						image: z.string().optional(),
 						registrationRecord,
 						state,
@@ -98,7 +104,7 @@ export const signUpEndpoints = (shared: Shared) => {
 							OPAQUE_ERROR_CODES.EMAIL_MISMATCH,
 						);
 					}
-					await assertValidRegistrationRecord(
+					assertValidRegistrationRecord(
 						shared.serverSetup,
 						decoded.credentialId,
 						record,
@@ -144,7 +150,9 @@ export const signUpEndpoints = (shared: Shared) => {
 							OPAQUE_ERROR_CODES.FAILED_TO_CREATE_USER,
 						);
 					}
-					await saveOpaqueRecord(ctx, undefined, {
+					await ctx.context.internalAdapter.createAccount({
+						providerId: "opaque",
+						accountId: user.id,
 						userId: user.id,
 						registrationRecord: record,
 						credentialId: decoded.credentialId,
@@ -167,7 +175,7 @@ export const signUpEndpoints = (shared: Shared) => {
 					}
 					return { status: true, token: null };
 				} finally {
-					await enforceMinimumDuration(started, floorMs);
+					await enforceMinimumDuration(started, options.timingSafeResponseMs);
 				}
 			},
 		),

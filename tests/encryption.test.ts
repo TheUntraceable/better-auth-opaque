@@ -44,6 +44,28 @@ describe("encrypted handshake state", () => {
 		expect(decoded).toEqual(state);
 	});
 
+	test("a state issued before a secret rotation still decrypts after it", async () => {
+		const state = {
+			purpose: "set-password",
+			stateId: "x",
+			issuedAt: Date.now(),
+			userId: "u",
+			newCredentialId: "n",
+		} as const;
+		const before = { keys: new Map([[1, "old-secret"]]), currentVersion: 1 };
+		const after = {
+			keys: new Map([
+				[2, "new-secret"],
+				[1, "old-secret"],
+			]),
+			currentVersion: 2,
+		};
+		const encrypted = await encryptState(state, before);
+		await expect(
+			decryptState(encrypted, after, "set-password", Infinity),
+		).resolves.toEqual(state);
+	});
+
 	test("rejects the wrong purpose, an expired state, and tampering", async () => {
 		const encrypted = await encryptState(
 			{
