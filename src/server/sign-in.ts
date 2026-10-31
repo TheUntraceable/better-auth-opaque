@@ -1,20 +1,17 @@
-import { server } from "@serenity-kit/opaque";
-import { APIError } from "better-auth";
-import {
-	createAuthEndpoint,
-	createEmailVerificationToken,
-} from "better-auth/api";
-import { setSessionCookie } from "better-auth/cookies";
-import { generateRandomString } from "better-auth/crypto";
+import { APIError, generateId } from "better-auth";
+import { createAuthEndpoint, sendVerificationEmailFn } from "better-auth/api";
 import { parseUserOutput } from "better-auth/db";
 import * as z from "zod";
 import { OPAQUE_ERROR_CODES } from "../error-codes";
 import {
-	credentialIdFor,
 	fakeCredentialId,
 	findOpaqueAccount,
+	type LoginIdentity,
+	loginIdentity,
+	matchesLoginIdentity,
 } from "./account";
 import {
+	emailAddress,
 	enforceMinimumDuration,
 	loginRequest,
 	loginResult,
@@ -27,12 +24,12 @@ import { PURPOSE } from "./state";
 export const signInEndpoints = (shared: Shared) => {
 	const {
 		options,
-		requireSetup,
 		issueState,
 		consumeState,
 		runHook,
-		finishLoginOrThrow,
-		floorMs,
+		startLogin,
+		finishLogin,
+		issueSession,
 	} = shared;
 
 	return {
@@ -41,7 +38,7 @@ export const signInEndpoints = (shared: Shared) => {
 			{
 				method: "POST",
 				body: z.object({
-					email: z.email(),
+					email: emailAddress,
 					loginRequest,
 				}),
 				metadata: {
@@ -55,43 +52,40 @@ export const signInEndpoints = (shared: Shared) => {
 			async (ctx) => {
 				const started = performance.now();
 				try {
-					const setup = requireSetup();
 					const email = normalizeEmail(ctx.body.email);
 					const found = await ctx.context.internalAdapter.findUserByEmail(
 						email,
 					);
+					// A random id on the missing branch keeps the query count the same.
+					const account = await findOpaqueAccount(
+						ctx,
+						found?.user.id ?? generateId(),
+					);
+					const record = account?.registrationRecord ?? null;
+					// A null record makes the library simulate a registered user; the
+					// fake id keeps repeated attempts for one email consistent. A 2.x
+					// record needs the email as sent, so not the normalised one.
+					const identity: LoginIdentity =
+						account && record
+							? await loginIdentity(account, record, ctx.body.email)
+							: {
+									credentialId: await fakeCredentialId(shared.serverSetup, email),
+								};
 
-					let userId: string | null = null;
-					let credentialId: string;
-					let record: string | null = null;
-					if (found) {
-						const account = await findOpaqueAccount(ctx, found.user.id);
-						userId = found.user.id;
-						credentialId = credentialIdFor(account, email);
-						record = account?.registrationRecord ?? null;
-					} else {
-						// Same query count as the real branch, then a deterministic
-						// fake identifier so repeated attempts look consistent. A null
-						// record makes the library simulate a registered user.
-						await findOpaqueAccount(ctx, generateRandomString(32));
-						credentialId = await fakeCredentialId(ctx.context.secret, email);
-					}
-
-					const { loginResponse, serverLoginState } = server.startLogin({
-						serverSetup: setup,
-						userIdentifier: credentialId,
+					const { loginResponse, serverLoginState } = startLogin({
+						userIdentifier: identity.credentialId,
 						registrationRecord: record,
 						startLoginRequest: ctx.body.loginRequest,
 					});
 					const encrypted = await issueState(ctx, {
 						purpose: PURPOSE.signIn,
 						serverLoginState,
-						userId,
-						credentialId,
+						userId: found?.user.id ?? null,
+						...identity,
 					});
 					return { challenge: loginResponse, state: encrypted };
 				} finally {
-					await enforceMinimumDuration(started, floorMs);
+					await enforceMinimumDuration(started, options.timingSafeResponseMs);
 				}
 			},
 		),
@@ -116,13 +110,7 @@ export const signInEndpoints = (shared: Shared) => {
 			},
 			async (ctx) => {
 				const decoded = await consumeState(ctx, ctx.body.state, PURPOSE.signIn);
-				if (!decoded.serverLoginState) {
-					throw APIError.from(
-						"BAD_REQUEST",
-						OPAQUE_ERROR_CODES.INVALID_LOGIN_STATE,
-					);
-				}
-				finishLoginOrThrow(
+				const sessionKey = finishLogin(
 					ctx.body.loginResult,
 					decoded.serverLoginState,
 					OPAQUE_ERROR_CODES.INVALID_EMAIL_OR_PASSWORD,
@@ -135,11 +123,7 @@ export const signInEndpoints = (shared: Shared) => {
 				const account = user
 					? await findOpaqueAccount(ctx, user.id)
 					: undefined;
-				if (
-					!user ||
-					!account ||
-					credentialIdFor(account, user.email) !== decoded.credentialId
-				) {
+				if (!user || !(await matchesLoginIdentity(account, decoded))) {
 					// Also covers a challenge minted before a password change.
 					throw APIError.from(
 						"UNAUTHORIZED",
@@ -147,26 +131,13 @@ export const signInEndpoints = (shared: Shared) => {
 					);
 				}
 
-				const requireVerification =
-					options.requireEmailVerification ??
-					ctx.context.options.emailAndPassword?.requireEmailVerification;
-				if (requireVerification && !user.emailVerified) {
+				if (shared.requireVerification && !user.emailVerified) {
 					const emailVerification = ctx.context.options.emailVerification;
 					if (
 						emailVerification?.sendOnSignIn &&
 						emailVerification.sendVerificationEmail
 					) {
-						const token = await createEmailVerificationToken(
-							ctx.context.secret,
-							user.email,
-							undefined,
-							emailVerification.expiresIn,
-						);
-						const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(ctx.body.callbackURL || "/")}`;
-						const sendVerificationEmail = emailVerification.sendVerificationEmail;
-						await runHook(ctx, () =>
-							sendVerificationEmail({ user, url, token }, ctx.request),
-						);
+						await runHook(ctx, () => sendVerificationEmailFn(ctx, user));
 					}
 					throw APIError.from(
 						"FORBIDDEN",
@@ -174,19 +145,19 @@ export const signInEndpoints = (shared: Shared) => {
 					);
 				}
 
-				const dontRememberMe = ctx.body.rememberMe === false;
-				const session = await ctx.context.internalAdapter.createSession(
-					user.id,
-					dontRememberMe,
+				const session = await issueSession(
+					ctx,
+					user,
+					ctx.body.rememberMe === false,
 				);
-				if (!session) {
-					throw APIError.from(
-						"INTERNAL_SERVER_ERROR",
-						OPAQUE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
-					);
-				}
-				await setSessionCookie(ctx, { session, user }, dontRememberMe);
+				await runHook(ctx, () =>
+					options.onSessionKey?.({ user, session, sessionKey }, ctx),
+				);
+				// Never a redirect, unlike signIn.email: better-auth's client follows
+				// one inside the fetch, before the action hands the app its export
+				// key. callbackURL only feeds the verification email link.
 				return {
+					redirect: false,
 					token: session.token,
 					user: parseUserOutput(ctx.context.options, user),
 				};

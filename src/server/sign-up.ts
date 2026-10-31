@@ -1,16 +1,11 @@
-import { server } from "@serenity-kit/opaque";
-import { APIError, type User } from "better-auth";
-import {
-	createAuthEndpoint,
-	createEmailVerificationToken,
-} from "better-auth/api";
-import { setSessionCookie } from "better-auth/cookies";
-import { generateRandomString } from "better-auth/crypto";
+import { APIError, generateId, type User } from "better-auth";
+import { createAuthEndpoint, sendVerificationEmailFn } from "better-auth/api";
 import { parseUserInput } from "better-auth/db";
 import * as z from "zod";
 import { OPAQUE_ERROR_CODES } from "../error-codes";
 import { assertValidRegistrationRecord } from "./account";
 import {
+	emailAddress,
 	enforceMinimumDuration,
 	normalizeEmail,
 	registrationRecord,
@@ -20,9 +15,17 @@ import {
 } from "./shared";
 import { PURPOSE } from "./state";
 
+const MAX_NAME_LENGTH = 100;
+
 export const signUpEndpoints = (shared: Shared) => {
-	const { options, requireSetup, issueState, consumeState, runHook, floorMs } =
-		shared;
+	const {
+		options,
+		issueState,
+		consumeState,
+		runHook,
+		issueSession,
+		createRegistrationResponse,
+	} = shared;
 
 	return {
 		opaqueSignUpChallenge: createAuthEndpoint(
@@ -30,7 +33,7 @@ export const signUpEndpoints = (shared: Shared) => {
 			{
 				method: "POST",
 				body: z.object({
-					email: z.email(),
+					email: emailAddress,
 					registrationRequest,
 				}),
 				metadata: {
@@ -42,13 +45,11 @@ export const signUpEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const setup = requireSetup();
 				const email = normalizeEmail(ctx.body.email);
 				// No lookup here: the challenge does not depend on whether the
 				// account exists, so there is nothing to hide.
-				const credentialId = generateRandomString(32);
-				const { registrationResponse } = server.createRegistrationResponse({
-					serverSetup: setup,
+				const credentialId = generateId();
+				const challenge = createRegistrationResponse({
 					userIdentifier: credentialId,
 					registrationRequest: ctx.body.registrationRequest,
 				});
@@ -57,7 +58,7 @@ export const signUpEndpoints = (shared: Shared) => {
 					email,
 					credentialId,
 				});
-				return { challenge: registrationResponse, state: encrypted };
+				return { challenge, state: encrypted };
 			},
 		),
 
@@ -67,8 +68,8 @@ export const signUpEndpoints = (shared: Shared) => {
 				method: "POST",
 				body: z
 					.object({
-						email: z.email(),
-						name: z.string().min(1).max(100),
+						email: emailAddress,
+						name: z.string().min(1).max(MAX_NAME_LENGTH),
 						image: z.string().optional(),
 						registrationRecord,
 						state,
@@ -86,7 +87,6 @@ export const signUpEndpoints = (shared: Shared) => {
 			async (ctx) => {
 				const started = performance.now();
 				try {
-					const setup = requireSetup();
 					const {
 						email: rawEmail,
 						name,
@@ -98,33 +98,38 @@ export const signUpEndpoints = (shared: Shared) => {
 					} = ctx.body;
 					const email = normalizeEmail(rawEmail);
 					const decoded = await consumeState(ctx, encrypted, PURPOSE.signUp);
-					if (decoded.email !== email || !decoded.credentialId) {
+					if (decoded.email !== email) {
 						throw APIError.from(
 							"BAD_REQUEST",
 							OPAQUE_ERROR_CODES.EMAIL_MISMATCH,
 						);
 					}
-					await assertValidRegistrationRecord(
-						setup,
+					assertValidRegistrationRecord(
+						shared.serverSetup,
 						decoded.credentialId,
 						record,
 					);
 
-					const existing = await ctx.context.internalAdapter.findUserByEmail(
-						email,
-					);
-					if (existing) {
-						await runHook(ctx, () =>
-							options.onExistingUserSignUp?.({ user: existing.user }, ctx.request),
-						);
-						return { status: true, token: null };
-					}
-
+					// Parsed before the lookup so a disallowed or missing field is
+					// rejected the same way whether or not the email is registered.
 					const additionalFields = parseUserInput(
 						ctx.context.options,
 						rest,
 						"create",
 					);
+					const existing = await ctx.context.internalAdapter.findUserByEmail(
+						email,
+					);
+					if (existing) {
+						await runHook(ctx, () =>
+							options.onExistingUserSignUp?.(
+								{ user: existing.user },
+								ctx.request,
+							),
+						);
+						return { status: true, token: null };
+					}
+
 					let user: User;
 					try {
 						user = await ctx.context.internalAdapter.createUser(
@@ -151,44 +156,26 @@ export const signUpEndpoints = (shared: Shared) => {
 						userId: user.id,
 						registrationRecord: record,
 						credentialId: decoded.credentialId,
-					} as Parameters<
-						typeof ctx.context.internalAdapter.createAccount
-					>[0]);
+					});
 
 					const emailVerification = ctx.context.options.emailVerification;
-					const requireVerification =
-						options.requireEmailVerification ??
-						ctx.context.options.emailAndPassword?.requireEmailVerification;
 					if (
-						(emailVerification?.sendOnSignUp || requireVerification) &&
+						(emailVerification?.sendOnSignUp ?? shared.requireVerification) &&
 						emailVerification?.sendVerificationEmail
 					) {
-						const token = await createEmailVerificationToken(
-							ctx.context.secret,
-							user.email,
-							undefined,
-							emailVerification.expiresIn,
-						);
-						const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(callbackURL || "/")}`;
-						const sendVerificationEmail = emailVerification.sendVerificationEmail;
-						await runHook(ctx, () =>
-							sendVerificationEmail({ user, url, token }, ctx.request),
-						);
+						await runHook(ctx, () => sendVerificationEmailFn(ctx, user));
 					}
 
-					if (options.insecureCreateSessionOnRegister) {
-						const session = await ctx.context.internalAdapter.createSession(
-							user.id,
-							false,
-						);
-						if (session) {
-							await setSessionCookie(ctx, { session, user });
-							return { status: true, token: session.token };
-						}
+					if (
+						options.insecureCreateSessionOnRegister &&
+						!shared.requireVerification
+					) {
+						const session = await issueSession(ctx, user, false);
+						return { status: true, token: session.token };
 					}
 					return { status: true, token: null };
 				} finally {
-					await enforceMinimumDuration(started, floorMs);
+					await enforceMinimumDuration(started, options.timingSafeResponseMs);
 				}
 			},
 		),

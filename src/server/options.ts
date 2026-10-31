@@ -1,14 +1,20 @@
-import type { User } from "better-auth";
+import type { GenericEndpointContext, Session, User } from "better-auth";
 
 export interface OpaqueOptions {
 	/**
 	 * The OPAQUE server setup, generated once with
-	 * `import { server } from "@serenity-kit/opaque"; server.createSetup()`.
+	 * `npx @serenity-kit/opaque@0.9 create-server-setup`.
 	 *
 	 * Every registration record is bound to this value. Rotating it
 	 * invalidates every password; losing it locks every user out.
-	 * Required in production. In development a per-process key is generated
-	 * and accounts do not survive a restart.
+	 * Required unless `NODE_ENV` is `development` or `test`, where a
+	 * per-process key is generated and accounts do not survive a restart.
+	 */
+	serverSetup?: string | undefined;
+
+	/**
+	 * @deprecated Renamed to `serverSetup`. Still read when `serverSetup` is
+	 * not set.
 	 */
 	OPAQUE_SERVER_KEY?: string | undefined;
 
@@ -17,7 +23,8 @@ export interface OpaqueOptions {
 	 *
 	 * Off by default because it turns the sign-up endpoint into an account
 	 * existence oracle (an existing email cannot be issued a session). Only
-	 * enable it if you accept that trade-off.
+	 * enable it if you accept that trade-off. Ignored while email
+	 * verification is required, like core's `autoSignIn`.
 	 */
 	insecureCreateSessionOnRegister?: boolean | undefined;
 
@@ -52,6 +59,20 @@ export interface OpaqueOptions {
 		| undefined;
 
 	/**
+	 * Receives the server's copy of the key derived by a successful sign-in
+	 * handshake, the same value the client returns as `sessionKey`. The
+	 * plugin never stores it, so this is the only place the server can get
+	 * it. Like the other hooks, an error it throws is logged and does not
+	 * change the response.
+	 */
+	onSessionKey?:
+		| ((
+				data: { user: User; session: Session; sessionKey: string },
+				ctx: GenericEndpointContext,
+		  ) => Promise<void> | void)
+		| undefined;
+
+	/**
 	 * Deliver a password reset email. Required for `opaque.requestPasswordReset`.
 	 * `url` points at the plugin's redirect endpoint, which forwards the
 	 * browser to `redirectTo?token=...`.
@@ -73,4 +94,11 @@ export interface OpaqueOptions {
 	 * handshake in well under a second; the default is 120.
 	 */
 	challengeExpiresIn?: number | undefined;
+
+	/**
+	 * One window and max for every `/opaque/*` endpoint, replacing the
+	 * defaults: 3 per 60 seconds for the reset request, 3 per 10 seconds for
+	 * each challenge, 5 per 10 seconds for the rest.
+	 */
+	rateLimit?: { window: number; max: number } | undefined;
 }

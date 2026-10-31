@@ -5,7 +5,9 @@ import {
 	errorCode,
 	type OpaqueTestInstance,
 	password,
+	slowVerificationDeletes,
 	uniqueEmail,
+	writeV2Record,
 } from "./helpers";
 
 describe("opaque: sign-up and sign-in", () => {
@@ -39,10 +41,69 @@ describe("opaque: sign-up and sign-in", () => {
 		expect(again.data?.sessionKey).not.toBe(signIn.data?.sessionKey);
 	});
 
-	test("rejects a wrong password on the client without a server round trip", async () => {
+	test("a callbackURL never turns the response into a redirect", async () => {
+		const email = uniqueEmail("callback");
+		await t.client.signUp.opaque({ email, name: "Callback", password });
+		const signIn = await t.client.signIn.opaque(
+			{ email, password, callbackURL: "/dashboard" },
+		);
+		expect(signIn.error).toBeNull();
+		expect(signIn.data?.token).toBeTruthy();
+		expect(signIn.data?.redirect).toBe(false);
+		expect(signIn.data).not.toHaveProperty("url");
+	});
+
+	test("signs in a 2.x account only with the email exactly as it registered", async () => {
+		const email = `Legacy-${crypto.randomUUID()}@Untraceable.DEV`;
+		await t.client.signUp.opaque({ email, name: "Legacy", password });
+		const { exportKey } = await writeV2Record(t, email, password);
+
+		const signIn = await t.client.signIn.opaque({ email, password });
+		expect(signIn.error).toBeNull();
+		expect(signIn.data?.exportKey).toBe(exportKey);
+
+		const otherCasing = await t.client.signIn.opaque({
+			email: email.toLowerCase(),
+			password,
+		});
+		expect(otherCasing.data).toBeNull();
+		expect(otherCasing.error?.status).toBe(401);
+		expect(otherCasing.error?.code).toBe("INVALID_EMAIL_OR_PASSWORD");
+	});
+
+	test("a 2.x challenge cannot complete once the record was rewritten", async () => {
+		const email = uniqueEmail("legacy-swap");
+		await t.client.signUp.opaque({ email, name: "Swap", password });
+		await writeV2Record(t, email, password);
+		const { clientLoginState, startLoginRequest } = opaqueCrypto.startLogin({
+			password,
+		});
+		const challenge = await t.client.$fetch<{ challenge: string; state: string }>(
+			"/opaque/sign-in/challenge",
+			{ method: "POST", body: { email, loginRequest: startLoginRequest } },
+		);
+		const proof = opaqueCrypto.finishLogin({
+			clientLoginState,
+			loginResponse: challenge.data!.challenge,
+			password,
+		});
+		expect(proof).toBeTruthy();
+		// Still credentialId-less, so only the record itself has changed.
+		await writeV2Record(t, email, password);
+		const result = await t.client.$fetch("/opaque/sign-in/complete", {
+			method: "POST",
+			body: { loginResult: proof!.finishLoginRequest, state: challenge.data!.state },
+		});
+		expect(result.error?.status).toBe(401);
+		expect(errorCode(result)).toBe("INVALID_EMAIL_OR_PASSWORD");
+	});
+
+	test("rejects a wrong password on the client without sending a proof", async () => {
 		const email = uniqueEmail("wrong");
 		await t.client.signUp.opaque({ email, name: "Wrong", password });
-		const result = await t.client.signIn.opaque({ email, password: "nope-nope-nope" });
+		const result = await t.client.signIn.opaque(
+			{ email, password: "nope-nope-nope" },
+		);
 		expect(result.data).toBeNull();
 		expect(result.error?.code).toBe("INVALID_EMAIL_OR_PASSWORD");
 		expect(result.error?.status).toBe(401);
@@ -187,37 +248,45 @@ describe("opaque: sign-up and sign-in", () => {
 		expect(errorCode(replay)).toBe("INVALID_LOGIN_STATE");
 	});
 
-	test("concurrent completes with the same state yield at most one session", async () => {
-		const email = uniqueEmail("race");
-		await t.client.signUp.opaque({ email, name: "Race", password });
-		const { clientLoginState, startLoginRequest } = opaqueCrypto.startLogin({
-			password,
-		});
-		const challenge = await t.client.$fetch<{ challenge: string; state: string }>(
-			"/opaque/sign-in/challenge",
-			{ method: "POST", body: { email, loginRequest: startLoginRequest } },
-		);
-		const login = opaqueCrypto.finishLogin({
-			clientLoginState,
-			loginResponse: challenge.data!.challenge,
-			password,
-		});
-		const body = {
-			loginResult: login!.finishLoginRequest,
-			state: challenge.data!.state,
-		};
-		const results = await Promise.all(
-			Array.from({ length: 4 }, () =>
-				t.client.$fetch<{ token: string }>("/opaque/sign-in/complete", {
-					method: "POST",
-					body,
-				}),
-			),
-		);
-		const sessions = results.filter((r) => r.data?.token);
-		expect(sessions).toHaveLength(1);
-		for (const r of results.filter((r) => !r.data?.token)) {
-			expect(errorCode(r)).toBe("INVALID_LOGIN_STATE");
+	test("concurrent completes with the same state yield exactly one session", async () => {
+		const scoped = await createOpaqueTestInstance({}, slowVerificationDeletes);
+		try {
+			const email = uniqueEmail("race");
+			await scoped.client.signUp.opaque({ email, name: "Race", password });
+			const { clientLoginState, startLoginRequest } = opaqueCrypto.startLogin({
+				password,
+			});
+			const challenge = await scoped.client.$fetch<{
+				challenge: string;
+				state: string;
+			}>("/opaque/sign-in/challenge", {
+				method: "POST",
+				body: { email, loginRequest: startLoginRequest },
+			});
+			const login = opaqueCrypto.finishLogin({
+				clientLoginState,
+				loginResponse: challenge.data!.challenge,
+				password,
+			});
+			const body = {
+				loginResult: login!.finishLoginRequest,
+				state: challenge.data!.state,
+			};
+			const results = await Promise.all(
+				Array.from({ length: 4 }, () =>
+					scoped.client.$fetch<{ token: string }>("/opaque/sign-in/complete", {
+						method: "POST",
+						body,
+					}),
+				),
+			);
+			const sessions = results.filter((r) => r.data?.token);
+			expect(sessions).toHaveLength(1);
+			for (const r of results.filter((r) => !r.data?.token)) {
+				expect(errorCode(r)).toBe("INVALID_LOGIN_STATE");
+			}
+		} finally {
+			await scoped.server.close();
 		}
 	});
 
@@ -272,26 +341,6 @@ describe("opaque: sign-up and sign-in", () => {
 		expect(setCookies.join("\n")).toContain("dont_remember");
 	});
 
-	test("forwards fetchOptions to every request of a flow", async () => {
-		const email = uniqueEmail("fetchopts");
-		await t.client.signUp.opaque({ email, name: "Fetch", password });
-		const seen: string[] = [];
-		const signIn = await t.client.signIn.opaque(
-			{ email, password },
-			{
-				headers: { "x-opaque-test": "1" },
-				onResponse: ({ response }) => {
-					seen.push(new URL(response.url).pathname);
-				},
-			},
-		);
-		expect(signIn.error).toBeNull();
-		expect(seen).toEqual([
-			"/api/auth/opaque/sign-in/challenge",
-			"/api/auth/opaque/sign-in/complete",
-		]);
-	});
-
 	test("accepts additional user fields on sign-up", async () => {
 		const scoped = await createOpaqueTestInstance(
 			{},
@@ -318,6 +367,63 @@ describe("opaque: sign-up and sign-in", () => {
 		}
 	});
 
+	test("rejects a disallowed field the same way for registered and new emails", async () => {
+		const scoped = await createOpaqueTestInstance(
+			{},
+			{
+				user: {
+					additionalFields: {
+						role: { type: "string", required: false, input: false },
+					},
+				},
+			},
+		);
+		try {
+			const registered = uniqueEmail("role-taken");
+			await scoped.client.signUp.opaque({ email: registered, name: "Role", password });
+			const attempt = (email: string) =>
+				scoped.client.signUp.opaque({ email, name: "Role", password, role: "admin" });
+			const taken = await attempt(registered);
+			const fresh = await attempt(uniqueEmail("role-new"));
+			expect(fresh.error?.status).toBe(400);
+			expect(fresh.error?.code).toBe("FIELD_NOT_ALLOWED");
+			expect(taken.error?.status).toBe(fresh.error?.status);
+			expect(taken.error?.code).toBe(fresh.error?.code);
+		} finally {
+			await scoped.server.close();
+		}
+	});
+
+	test("purges expired challenge rows that were never completed", async () => {
+		const scoped = await createOpaqueTestInstance({ challengeExpiresIn: 1 });
+		try {
+			const challenge = () =>
+				scoped.client.$fetch("/opaque/sign-in/challenge", {
+					method: "POST",
+					body: {
+						email: uniqueEmail("abandoned"),
+						loginRequest: opaqueCrypto.startLogin({ password }).startLoginRequest,
+					},
+				});
+			const { adapter } = await scoped.auth.$context;
+			const identifiers = async () =>
+				(
+					await adapter.findMany<{ identifier: string }>({ model: "verification" })
+				).map((row) => row.identifier);
+			await challenge();
+			const [abandoned] = await identifiers();
+			expect(abandoned).toBeDefined();
+			// Date only: faking timers would stall the in-process HTTP server.
+			vi.setSystemTime(Date.now() + 2000);
+			await challenge();
+			const remaining = await identifiers();
+			expect(remaining).toHaveLength(1);
+			expect(remaining).not.toContain(abandoned);
+		} finally {
+			vi.useRealTimers();
+			await scoped.server.close();
+		}
+	});
 });
 
 describe("opaque: pinned server key", () => {

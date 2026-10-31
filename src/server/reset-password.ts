@@ -1,11 +1,14 @@
-import { server } from "@serenity-kit/opaque";
-import { APIError } from "better-auth";
+import { APIError, generateId } from "better-auth";
 import { createAuthEndpoint, originCheck } from "better-auth/api";
-import { generateRandomString } from "better-auth/crypto";
 import * as z from "zod";
 import { OPAQUE_ERROR_CODES } from "../error-codes";
-import { assertValidRegistrationRecord, findOpaqueAccount } from "./account";
 import {
+	assertValidRegistrationRecord,
+	findOpaqueAccount,
+	upsertOpaqueAccount,
+} from "./account";
+import {
+	emailAddress,
 	enforceMinimumDuration,
 	normalizeEmail,
 	registrationRecord,
@@ -15,17 +18,19 @@ import {
 } from "./shared";
 import { PURPOSE } from "./state";
 
+const DEFAULT_RESET_PASSWORD_TOKEN_EXPIRES_IN = 60 * 60;
+const MAX_RESET_TOKEN_CHARS = 256;
+
+const resetToken = z.string().min(1).max(MAX_RESET_TOKEN_CHARS);
 const resetIdentifier = (token: string) => `opaque-reset:${token}`;
 
 export const resetPasswordEndpoints = (shared: Shared) => {
 	const {
 		options,
-		requireSetup,
 		issueState,
 		consumeState,
 		runHook,
-		resetTtlMs,
-		floorMs,
+		createRegistrationResponse,
 	} = shared;
 
 	return {
@@ -34,7 +39,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 			{
 				method: "POST",
 				body: z.object({
-					email: z.email(),
+					email: emailAddress,
 					redirectTo: z.string().optional(),
 				}),
 				use: [originCheck((ctx) => ctx.body.redirectTo)],
@@ -71,11 +76,14 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 						);
 						return { status: true };
 					}
-					const token = generateRandomString(32);
+					const token = generateId();
+					const expiresIn =
+						options.resetPasswordTokenExpiresIn ??
+						DEFAULT_RESET_PASSWORD_TOKEN_EXPIRES_IN;
 					await ctx.context.internalAdapter.createVerificationValue({
 						identifier: resetIdentifier(token),
 						value: found.user.id,
-						expiresAt: new Date(Date.now() + resetTtlMs),
+						expiresAt: new Date(Date.now() + expiresIn * 1000),
 					});
 					const callbackURL = encodeURIComponent(ctx.body.redirectTo ?? "");
 					const url = `${ctx.context.baseURL}/opaque/reset-password/${token}?callbackURL=${callbackURL}`;
@@ -85,7 +93,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 					);
 					return { status: true };
 				} finally {
-					await enforceMinimumDuration(started, floorMs);
+					await enforceMinimumDuration(started, options.timingSafeResponseMs);
 				}
 			},
 		),
@@ -110,9 +118,10 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 					ctx.query.callbackURL || "/",
 					ctx.context.baseURL,
 				);
-				const verification = await ctx.context.internalAdapter.findVerificationValue(
-					resetIdentifier(token),
-				);
+				const verification =
+					await ctx.context.internalAdapter.findVerificationValue(
+						resetIdentifier(token),
+					);
 				if (!verification || verification.expiresAt < new Date()) {
 					target.searchParams.set("error", "INVALID_TOKEN");
 				} else {
@@ -127,7 +136,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 			{
 				method: "POST",
 				body: z.object({
-					token: z.string().min(1).max(256),
+					token: resetToken,
 					registrationRequest,
 				}),
 				metadata: {
@@ -139,16 +148,15 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const setup = requireSetup();
-				const verification = await ctx.context.internalAdapter.findVerificationValue(
-					resetIdentifier(ctx.body.token),
-				);
+				const verification =
+					await ctx.context.internalAdapter.findVerificationValue(
+						resetIdentifier(ctx.body.token),
+					);
 				if (!verification || verification.expiresAt < new Date()) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
-				const newCredentialId = generateRandomString(32);
-				const { registrationResponse } = server.createRegistrationResponse({
-					serverSetup: setup,
+				const newCredentialId = generateId();
+				const challenge = createRegistrationResponse({
 					userIdentifier: newCredentialId,
 					registrationRequest: ctx.body.registrationRequest,
 				});
@@ -158,7 +166,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 					newCredentialId,
 					token: ctx.body.token,
 				});
-				return { challenge: registrationResponse, state: encrypted };
+				return { challenge, state: encrypted };
 			},
 		),
 
@@ -167,7 +175,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 			{
 				method: "POST",
 				body: z.object({
-					token: z.string().min(1).max(256),
+					token: resetToken,
 					registrationRecord,
 					state,
 				}),
@@ -180,22 +188,19 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const setup = requireSetup();
 				const decoded = await consumeState(
 					ctx,
 					ctx.body.state,
 					PURPOSE.resetPassword,
 				);
 				const identifier = resetIdentifier(ctx.body.token);
-				const verification = await ctx.context.internalAdapter.findVerificationValue(
-					identifier,
-				);
+				const verification =
+					await ctx.context.internalAdapter.findVerificationValue(identifier);
 				if (
 					!verification ||
 					verification.expiresAt < new Date() ||
 					decoded.token !== ctx.body.token ||
-					decoded.userId !== verification.value ||
-					!decoded.newCredentialId
+					decoded.userId !== verification.value
 				) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
@@ -205,13 +210,15 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				if (!user) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
-				await assertValidRegistrationRecord(
-					setup,
+				assertValidRegistrationRecord(
+					shared.serverSetup,
 					decoded.newCredentialId,
 					ctx.body.registrationRecord,
 				);
-				// Burn the token atomically before touching the record, so two
-				// resets racing with the same link cannot both write.
+				// Burned before the write, outside a transaction: joining the two needs
+				// runWithTransaction from @better-auth/core, not a declared dependency.
+				// If the write then fails the user needs a new reset email; burning
+				// after it would let two resets racing on one link both write.
 				if (
 					!(await ctx.context.internalAdapter.consumeVerificationValue(
 						identifier,
@@ -219,24 +226,14 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
-				const account = await findOpaqueAccount(ctx, user.id);
-				if (account) {
-					await ctx.context.internalAdapter.updateAccount(account.id, {
-						registrationRecord: ctx.body.registrationRecord,
-						credentialId: decoded.newCredentialId,
-					} as Parameters<typeof ctx.context.internalAdapter.updateAccount>[1]);
-				} else {
-					await ctx.context.internalAdapter.createAccount({
-						providerId: "opaque",
-						accountId: user.id,
-						userId: user.id,
-						registrationRecord: ctx.body.registrationRecord,
-						credentialId: decoded.newCredentialId,
-					} as Parameters<
-						typeof ctx.context.internalAdapter.createAccount
-					>[0]);
-				}
+				// Revoked before the write, as core does: a revoke failing after it
+				// would leave pre-reset sessions alive under the new password.
 				await ctx.context.internalAdapter.deleteUserSessions(user.id);
+				await upsertOpaqueAccount(ctx, await findOpaqueAccount(ctx, user.id), {
+					userId: user.id,
+					registrationRecord: ctx.body.registrationRecord,
+					credentialId: decoded.newCredentialId,
+				});
 				return { status: true };
 			},
 		),

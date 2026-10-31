@@ -1,14 +1,10 @@
-import { server } from "@serenity-kit/opaque";
+import { client as opaqueCrypto, server } from "@serenity-kit/opaque";
 import type { BetterAuthOptions } from "better-auth";
 import { createAuthClient } from "better-auth/client";
 import { getHttpTestInstance } from "better-auth/test";
 import { opaqueClient, type OpaqueClientOptions } from "../src/client";
 import { opaque, type OpaqueOptions } from "../src/server";
-
-// Fixed key so registration records stay valid across the server instances a
-// test file may create. Test-only; never reuse outside this suite.
-export const TEST_OPAQUE_SERVER_KEY =
-	"bgTA0wwx_5WvwoyDHURXOsnN3u1y2uJLr1vXYGc1_F5yNgubuj6Pf4JVIM83aIWHHJ7GIPUxDW74-j8CEuv0Os4rE4lQ7GnBQk3nVLDl5s1J4BsNrPXqx_i-T44FaZYLQPDzr2huMv49zUIRxA15XVU9dFuzZZgf-XiaaNDnIA0";
+import { TEST_OPAQUE_SERVER_KEY } from "./test-key";
 
 export const TEST_OPAQUE_PUBLIC_KEY = () =>
 	server.getPublicKey(TEST_OPAQUE_SERVER_KEY);
@@ -18,6 +14,19 @@ export const password = "supersecurepassword";
 export const uniqueEmail = (prefix: string) =>
 	`${prefix}-${crypto.randomUUID()}@untraceable.dev`;
 
+// On the in-memory test database nothing yields between reading and deleting
+// a verification row, so a non-atomic consume would never visibly race.
+// Stalling each delete lets every concurrent request read the row first.
+export const slowVerificationDeletes: Partial<BetterAuthOptions> = {
+	databaseHooks: {
+		verification: {
+			delete: {
+				before: () => new Promise<void>((resolve) => setTimeout(resolve, 50)),
+			},
+		},
+	},
+};
+
 /**
  * Spins up a real better-auth instance (fresh in-memory SQLite, real HTTP
  * listener on an OS-assigned port) with the OPAQUE plugin installed, plus
@@ -26,7 +35,7 @@ export const uniqueEmail = (prefix: string) =>
  * Call `server.close()` in `afterAll`.
  */
 export async function createOpaqueTestInstance(
-	pluginOptions: Omit<OpaqueOptions, "OPAQUE_SERVER_KEY"> = {},
+	pluginOptions: OpaqueOptions = {},
 	authOptions: Partial<BetterAuthOptions> = {},
 	clientOptions: OpaqueClientOptions = {},
 ) {
@@ -36,7 +45,7 @@ export async function createOpaqueTestInstance(
 			logger: { level: "error" },
 			...authOptions,
 			plugins: [
-				opaque({ OPAQUE_SERVER_KEY: TEST_OPAQUE_SERVER_KEY, ...pluginOptions }),
+				opaque({ serverSetup: TEST_OPAQUE_SERVER_KEY, ...pluginOptions }),
 				...(authOptions.plugins ?? []),
 			],
 		},
@@ -53,11 +62,11 @@ export async function createOpaqueTestInstance(
 	// The shared client has no cookie jar, and the authenticated endpoints sit
 	// behind a session middleware. better-auth rejects cookie-bearing requests
 	// without an Origin header (CSRF check), so the jar also sets Origin.
-	const createSessionClient = () => {
+	const createSessionClient = (options: OpaqueClientOptions = clientOptions) => {
 		let cookie = "";
 		return createAuthClient({
 			baseURL: instance.baseURL,
-			plugins: [opaqueClient(clientOptions)],
+			plugins: [opaqueClient(options)],
 			fetchOptions: {
 				onRequest(context) {
 					if (cookie) {
@@ -85,3 +94,34 @@ export type OpaqueTestInstance = Awaited<
 /** Error code from a raw `$fetch` result, whose error type does not carry one. */
 export const errorCode = (result: { error: unknown }) =>
 	(result.error as { code?: string } | null)?.code;
+
+/**
+ * Rewrites a user's OPAQUE account the way 2.x stored it: no credentialId,
+ * and a record bound to the email string exactly as given here.
+ */
+export async function writeV2Record(
+	t: OpaqueTestInstance,
+	email: string,
+	password: string,
+) {
+	const { clientRegistrationState, registrationRequest } =
+		opaqueCrypto.startRegistration({ password });
+	const { registrationRecord, exportKey } = opaqueCrypto.finishRegistration({
+		clientRegistrationState,
+		password,
+		registrationResponse: server.createRegistrationResponse({
+			serverSetup: TEST_OPAQUE_SERVER_KEY,
+			userIdentifier: email,
+			registrationRequest,
+		}).registrationResponse,
+	});
+	const { internalAdapter } = await t.auth.$context;
+	const found = await internalAdapter.findUserByEmail(email);
+	const accounts = await internalAdapter.findAccounts(found!.user.id);
+	const account = accounts.find((a) => a.providerId === "opaque");
+	await internalAdapter.updateAccount(account!.id, {
+		registrationRecord,
+		credentialId: null,
+	} as never);
+	return { exportKey, accountId: account!.id };
+}

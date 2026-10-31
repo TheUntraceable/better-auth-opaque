@@ -13,6 +13,16 @@ export type { OpaqueOptions } from "./server/options";
 
 export const opaque = (options: OpaqueOptions = {}) => {
 	const shared = createShared(options);
+	// The first matching rule wins, so the catch-all comes last.
+	const rule = (
+		pathMatcher: (path: string) => boolean,
+		window: number,
+		max: number,
+	) => ({
+		pathMatcher,
+		window: options.rateLimit?.window ?? window,
+		max: options.rateLimit?.max ?? max,
+	});
 
 	return {
 		id: "opaque",
@@ -49,11 +59,13 @@ export const opaque = (options: OpaqueOptions = {}) => {
 			},
 		},
 		rateLimit: [
-			{
-				pathMatcher: (path) => path.startsWith("/opaque/"),
-				window: 10,
-				max: 5,
-			},
+			rule((path) => path === "/opaque/reset-password/request", 60, 3),
+			rule(
+				(path) => path.startsWith("/opaque/") && path.endsWith("/challenge"),
+				10,
+				3,
+			),
+			rule((path) => path.startsWith("/opaque/"), 10, 5),
 		],
 		endpoints: {
 			...signUpEndpoints(shared),

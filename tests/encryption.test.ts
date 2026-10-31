@@ -6,16 +6,23 @@ const secret = "supersecretkey";
 describe("encrypted handshake state", () => {
 	test("has the same length whatever it carries", async () => {
 		const small = await encryptState(
-			{ purpose: "sign-in", stateId: "a", issuedAt: Date.now(), userId: null },
+			{
+				purpose: "set-password",
+				stateId: "a",
+				issuedAt: Date.now(),
+				userId: "u",
+				newCredentialId: "n",
+			},
 			secret,
 		);
 		const large = await encryptState(
 			{
-				purpose: "sign-in",
+				purpose: "change-password",
 				stateId: "b".repeat(32),
 				issuedAt: Date.now(),
 				userId: "u".repeat(36),
 				credentialId: "c".repeat(43),
+				newCredentialId: "n".repeat(43),
 				serverLoginState: "s".repeat(256),
 			},
 			secret,
@@ -24,22 +31,51 @@ describe("encrypted handshake state", () => {
 	});
 
 	test("round-trips and strips padding", async () => {
-		const encrypted = await encryptState(
-			{ purpose: "sign-in", stateId: "x", issuedAt: 1, userId: "u1" },
-			secret,
-		);
-		const decoded = await decryptState(encrypted, secret, "sign-in", Infinity);
-		expect(decoded).toEqual({
+		const state = {
 			purpose: "sign-in",
 			stateId: "x",
 			issuedAt: 1,
 			userId: "u1",
-		});
+			credentialId: "c1",
+			serverLoginState: "s1",
+		} as const;
+		const encrypted = await encryptState(state, secret);
+		const decoded = await decryptState(encrypted, secret, "sign-in", Infinity);
+		expect(decoded).toEqual(state);
+	});
+
+	test("a state issued before a secret rotation still decrypts after it", async () => {
+		const state = {
+			purpose: "set-password",
+			stateId: "x",
+			issuedAt: Date.now(),
+			userId: "u",
+			newCredentialId: "n",
+		} as const;
+		const before = { keys: new Map([[1, "old-secret"]]), currentVersion: 1 };
+		const after = {
+			keys: new Map([
+				[2, "new-secret"],
+				[1, "old-secret"],
+			]),
+			currentVersion: 2,
+		};
+		const encrypted = await encryptState(state, before);
+		await expect(
+			decryptState(encrypted, after, "set-password", Infinity),
+		).resolves.toEqual(state);
 	});
 
 	test("rejects the wrong purpose, an expired state, and tampering", async () => {
 		const encrypted = await encryptState(
-			{ purpose: "sign-in", stateId: "x", issuedAt: Date.now() - 10_000 },
+			{
+				purpose: "sign-in",
+				stateId: "x",
+				issuedAt: Date.now() - 10_000,
+				userId: null,
+				credentialId: "c",
+				serverLoginState: "s",
+			},
 			secret,
 		);
 		await expect(

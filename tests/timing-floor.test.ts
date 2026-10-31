@@ -1,13 +1,24 @@
-import { client as opaqueCrypto, ready } from "@serenity-kit/opaque";
+import {
+	client as opaqueCrypto,
+	server as opaqueServer,
+	ready,
+} from "@serenity-kit/opaque";
+import { makeSignature } from "better-auth/crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
 	createOpaqueTestInstance,
 	type OpaqueTestInstance,
 	uniqueEmail,
 } from "./helpers";
+import { TEST_OPAQUE_SERVER_KEY } from "./test-key";
 
 // Deterministic checks on the enumeration defences. The statistical timing
 // tests live in tests/timing and are opt-in (OPAQUE_TIMING_TESTS=1).
+
+// The evaluated element is the first 32 bytes of the response. 42 base64url
+// chars cover 252 of those bits; the 43rd char already mixes in the random
+// masking nonce.
+const evaluation = (challenge: string | undefined) => challenge?.slice(0, 42);
 
 describe("enumeration defences", () => {
 	let t: OpaqueTestInstance;
@@ -43,10 +54,32 @@ describe("enumeration defences", () => {
 				body: { email, loginRequest: startLoginRequest },
 			});
 		const [a, b] = await Promise.all([post(), post()]);
-		// The evaluated element is the first 32 bytes of the response. 42 base64url
-		// chars cover 252 of those bits; the 43rd char already mixes in the random
-		// masking nonce.
-		expect(a.data?.challenge.slice(0, 42)).toBe(b.data?.challenge.slice(0, 42));
+		expect(evaluation(a.data?.challenge)).toBe(evaluation(b.data?.challenge));
+	});
+
+	test("emails without an OPAQUE record are evaluated under the setup-keyed fake id", async () => {
+		const coreOnly = uniqueEmail("core-only");
+		await t.auth.api.signUpEmail({
+			body: { email: coreOnly, name: "Core", password: "core-password-123" },
+		});
+		const { startLoginRequest } = opaqueCrypto.startLogin({ password });
+		for (const email of [coreOnly, uniqueEmail("nobody")]) {
+			const response = await t.client.$fetch<{ challenge: string }>(
+				"/opaque/sign-in/challenge",
+				{ method: "POST", body: { email, loginRequest: startLoginRequest } },
+			);
+			// Computed without the auth secret, so rotating it cannot move these.
+			const expected = opaqueServer.startLogin({
+				serverSetup: TEST_OPAQUE_SERVER_KEY,
+				userIdentifier: await makeSignature(
+					`better-auth-opaque:fake-credential:${email}`,
+					TEST_OPAQUE_SERVER_KEY,
+				),
+				registrationRecord: null,
+				startLoginRequest,
+			}).loginResponse;
+			expect(evaluation(response.data?.challenge)).toBe(evaluation(expected));
+		}
 	});
 
 	test("timingSafeResponseMs pads the existence-dependent endpoints", async () => {
