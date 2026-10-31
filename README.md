@@ -10,9 +10,9 @@ With OPAQUE the password never leaves the device. The server stores a per-user r
 
 ## Features
 
-* **Zero-knowledge passwords.** The server never sees, stores or hashes the password.
-* **Export key.** Every sign-up, sign-in, password change and reset gives the client a stable 64-byte secret derived from the password. Use it to unlock client-side encrypted data.
-* **Session key.** Each login handshake also yields a fresh shared key on both sides.
+* **The password never leaves the device.** The server never sees, stores or hashes the password.
+* **Export key.** Every sign-up, sign-in, password change, set and reset gives the client a 64-byte secret derived from the password, stable until the password is changed, set or reset, even to the same value. Use it to unlock client-side encrypted data.
+* **Session key.** Each sign-in also yields a fresh key that both sides derive. The server never stores its copy; the `onSessionKey` option is the only way to use it there.
 * **Complete password lifecycle.** Sign up, sign in, change password, set a password on a social-login account, and email-based password reset, all OPAQUE-native.
 * **Server key pinning.** The client can pin the server's OPAQUE public key and refuse a swapped key or a man-in-the-middle.
 * **Enumeration resistant by design.** Unknown emails get a real challenge computed under a deterministic fake record, the same query count, and the same response shape (see [Security](#security)).
@@ -33,7 +33,7 @@ bun add better-auth-opaque
 npm install better-auth-opaque
 ```
 
-Peer dependencies: `better-auth` 1.7 or newer and `zod` 4. `@serenity-kit/opaque` (the WebAssembly OPAQUE implementation) is installed automatically. The server plugin runs anywhere Better Auth does with a global Web Crypto API: Node 20+, Bun, and the edge runtimes.
+Peer dependencies: `better-auth` 1.7 or newer and `zod` 4. `@serenity-kit/opaque` (the WebAssembly OPAQUE implementation) is installed automatically. The server plugin needs a global Web Crypto API (`globalThis.crypto`).
 
 The plugin adds two columns to the `account` table, `registrationRecord` and `credentialId`. Run your Better Auth migration (`npx @better-auth/cli migrate` or `generate`) after installing.
 
@@ -42,7 +42,7 @@ The plugin adds two columns to the `account` table, `registrationRecord` and `cr
 ### 1. Generate the server key
 
 ```bash
-npx @serenity-kit/opaque@latest create-server-setup
+npx @serenity-kit/opaque@0.9 create-server-setup
 ```
 
 ```env
@@ -50,7 +50,7 @@ npx @serenity-kit/opaque@latest create-server-setup
 OPAQUE_SERVER_KEY="..."
 ```
 
-Every registration record is bound to this key. Rotating it invalidates every password; losing it locks every user out. Back it up like a database master key. The plugin refuses to start without it when `NODE_ENV=production`; in development it generates a temporary key and warns that accounts will not survive a restart.
+Every registration record is bound to this key. Rotating it invalidates every password; losing it locks every user out. Back it up like a database master key. Without it the plugin throws at startup unless `NODE_ENV` is `development` or `test`; there it generates a temporary key and warns that accounts will not survive a restart.
 
 ### 2. Server
 
@@ -63,7 +63,7 @@ export const auth = betterAuth({
     secret: process.env.BETTER_AUTH_SECRET, // also encrypts the in-flight handshake state
     plugins: [
         opaque({
-            OPAQUE_SERVER_KEY: process.env.OPAQUE_SERVER_KEY,
+            serverSetup: process.env.OPAQUE_SERVER_KEY,
 
             // Needed for opaque.requestPasswordReset
             sendResetPassword: async ({ user, url, token }) => {
@@ -79,20 +79,9 @@ export const auth = betterAuth({
 });
 ```
 
-All options:
+All options are listed in [docs/reference.md](docs/reference.md#options).
 
-| Option | Default | Purpose |
-| :-- | :-- | :-- |
-| `OPAQUE_SERVER_KEY` | required in production | The server setup from `create-server-setup`. |
-| `sendResetPassword` | none | Delivers the reset email. `url` goes through the plugin's redirect endpoint and lands on `redirectTo?token=...`. |
-| `resetPasswordTokenExpiresIn` | `3600` | Reset token lifetime in seconds. |
-| `onExistingUserSignUp` | none | Called when a sign-up targets an existing email. The HTTP response is identical either way. |
-| `requireEmailVerification` | `emailAndPassword.requireEmailVerification` | Block sign-in until the email is verified. Verification emails are sent on sign-up when `emailVerification.sendOnSignUp` or this is set. |
-| `challengeExpiresIn` | `120` | Seconds a challenge stays valid between the two steps. Each one can be completed exactly once. |
-| `timingSafeResponseMs` | off | Minimum response time for the three endpoints whose work depends on whether an account exists. See [Security](#security). |
-| `insecureCreateSessionOnRegister` | `false` | Issue a session straight from sign-up. Makes sign-up an account-existence oracle. |
-
-`sendResetPassword`, `onExistingUserSignUp` and Better Auth's `sendVerificationEmail` run through Better Auth's background-task runner: detached when `advanced.backgroundTasks` is configured, awaited otherwise. An error thrown by any of them is logged and never returned to the client, because a 500 that only happens when the account exists would be an enumeration oracle. Watch your logs for mailer failures.
+`sendResetPassword`, `onExistingUserSignUp`, `onSessionKey` and Better Auth's `sendVerificationEmail` run through Better Auth's background-task runner: detached when `advanced.backgroundTasks` is configured, awaited otherwise. An error thrown by any of them is logged and never returned to the client, because a 500 that only happens when the account exists would be an enumeration oracle. Watch your logs for mailer failures.
 
 ### 3. Client
 
@@ -112,11 +101,20 @@ export const authClient = createAuthClient({
 });
 ```
 
-`better-auth-opaque/client` contains only client code. The root import also works, and `better-auth-opaque/server` exposes only the server plugin.
+Browser code should import from `better-auth-opaque/client`, which contains only client code. The root export also includes the server plugin, so with a bundler that does not tree-shake it pulls server-only modules into the browser bundle. `better-auth-opaque/server` exposes only the server plugin.
 
 ## Usage
 
-Every action returns `{ data, error }` like the rest of the Better Auth client, accepts an optional second `fetchOptions` argument (`headers`, `query`, `signal`, `onSuccess`, `onError`, ... applied to every request of the flow), and refreshes `useSession` when the session changes.
+Every action returns `{ data, error }` like the rest of the Better Auth client and refreshes `useSession` when the session changes. Each accepts `fetchOptions` (anything `$fetch` accepts except `method` and `body`) inside its first argument, as core actions do, or as a second argument; where both set the same option, the first argument's wins.
+
+Every action except `requestPasswordReset` makes two requests but behaves as one call:
+
+* Transport options such as `headers` go on every request, and so does a header set in `onRequest`.
+* `onRequest` fires once. `onResponse`, `onSuccess` and `onError` fire once with the final outcome, so a wrong password fires `onError`, never `onSuccess`. For failures decided on the client (wrong password, pinned-key mismatch, `REQUEST_FAILED`) they receive a stand-in `Response` carrying the error status. A response returned from `onResponse` is ignored.
+* Hooks set globally in `createAuthClient({ fetchOptions })` still fire per request, because Better Auth installs them as a fetch plugin: a wrong-password sign-in reaches them as a successful challenge.
+* With `throw: true` (per call, in the first argument's `fetchOptions`, or global) a failure throws `OpaqueFetchError`, exported from `better-auth-opaque/client` and the root. It has the same shape as better-fetch's `BetterFetchError` (`status`, `statusText`, `error`) but is not an instance of it. Success still returns `{ data, error: null }`, whereas core actions return the bare data under `throw: true`.
+
+Every action except `requestPasswordReset` also returns `serverPublicKey`.
 
 ### Sign up
 
@@ -128,7 +126,7 @@ const { data, error } = await authClient.signUp.opaque({
     // image, callbackURL and any user.additionalFields are accepted too
 });
 // data.status      -> true (also when the email already exists; see Security)
-// data.token       -> null unless insecureCreateSessionOnRegister is on
+// data.token       -> null unless insecureCreateSessionOnRegister is on and email verification is not required
 // data.exportKey   -> keep this on the device if you use client-side encryption
 ```
 
@@ -144,12 +142,14 @@ const { data, error } = await authClient.signIn.opaque({
 });
 if (error?.code === "INVALID_EMAIL_OR_PASSWORD") { /* wrong password or no account */ }
 if (error?.code === "EMAIL_NOT_VERIFIED") { /* requireEmailVerification is on */ }
-// data.token, data.user   -> same shape as signIn.email
-// data.exportKey          -> same value signUp.opaque returned
-// data.sessionKey         -> fresh per login, shared with the server, not stored by it
+// data.token, data.user   -> as signIn.email, but data.redirect is always false and there is no data.url
+// data.exportKey          -> same value signUp.opaque returned, until the password changes
+// data.sessionKey         -> fresh per sign-in; the server never stores its copy (see onSessionKey)
 ```
 
 A wrong password is detected on the client: the handshake fails locally and no proof is ever sent, so the server only ever sees challenge requests.
+
+`callbackURL` is accepted but only used for the link in a verification email (`emailVerification.sendOnSignIn`). Unlike `signIn.email`, the response is never a redirect: Better Auth's client would navigate away inside the request, before the action hands you the export key. Store the key, then redirect yourself.
 
 ### Change password
 
@@ -164,7 +164,7 @@ const { data, error } = await authClient.opaque.changePassword({
 // data.exportKey         -> the key for the NEW password
 ```
 
-Requires a fresh session (Better Auth's sensitive-session rule). The current password is proven with a full OPAQUE login before anything changes.
+Requires a fresh session, one created within Better Auth's `session.freshAge` (default one day); otherwise the action fails with 403 `SESSION_NOT_FRESH`. The current password is proven with a full OPAQUE login before anything changes.
 
 ### Set a password on an account that has none
 
@@ -173,6 +173,8 @@ Requires a fresh session (Better Auth's sensitive-session rule). The current pas
 const { data, error } = await authClient.opaque.setPassword({ password });
 // error.code === "OPAQUE_ACCOUNT_EXISTS" if one is already set
 ```
+
+Also requires a fresh session.
 
 ### Reset a forgotten password
 
@@ -193,7 +195,7 @@ const { data, error } = await authClient.opaque.resetPassword({
 
 ### Using the export key
 
-The export key is the reason to use OPAQUE over bcrypt. It is a 64-byte secret, stable for a given password, that only the client ever holds. A typical pattern:
+The export key is the reason to use OPAQUE over bcrypt. It is a 64-byte secret that only the client ever holds, stable until the password is changed, set or reset, even to the same value. A typical pattern:
 
 ```typescript
 // On sign-up: make a random data key, wrap it with a key derived from exportKey
@@ -216,57 +218,23 @@ Two rules follow from this:
 * **Never send the export key to the server.** The plugin does not, and your code should not either.
 * **A password reset produces a new export key and the old one is gone.** Anything wrapped only under the old key is unrecoverable. If you build client-side encryption, give users a recovery key or re-wrap the data key from a signed-in session before they lose access.
 
-### Error codes
+## Reference
 
-Every failure carries a `code`. The plugin's codes are available as `OPAQUE_ERROR_CODES` from the package and are inferred onto `authClient.$ERROR_CODES` for typing.
-
-| Code | Meaning |
-| :-- | :-- |
-| `INVALID_EMAIL_OR_PASSWORD` | Wrong password, or no account with that email. |
-| `INVALID_PASSWORD` | Wrong current password during a change. |
-| `EMAIL_NOT_VERIFIED` | Sign-in blocked until the email is verified. |
-| `INVALID_LOGIN_STATE` | The challenge expired, was already used, or belongs to another flow. Start over. |
-| `INVALID_TOKEN` | Reset token unknown, expired or already used. |
-| `NO_OPAQUE_ACCOUNT` | The signed-in user has no OPAQUE password. Use `setPassword`. |
-| `OPAQUE_ACCOUNT_EXISTS` | `setPassword` on an account that already has one. Use `changePassword`. |
-| `SERVER_KEY_MISMATCH` | The server's key does not match the pinned `serverPublicKey`. |
-| `INVALID_REGISTRATION_RECORD` | The client sent a record the server could not use. |
-| `RESET_PASSWORD_NOT_CONFIGURED` | `sendResetPassword` is missing from the plugin options. |
-
-## Endpoints
-
-All endpoints live under `/api/auth/opaque/` and are rate limited to 5 requests per 10 seconds per IP and path. The two-step flows are driven by the client plugin; call them directly only if you are writing your own client.
-
-| Flow | Method | Path | Auth |
-| :-- | :-- | :-- | :-- |
-| Sign up | `POST` | `/opaque/sign-up/challenge` | none |
-| Sign up | `POST` | `/opaque/sign-up/complete` | none |
-| Sign in | `POST` | `/opaque/sign-in/challenge` | none |
-| Sign in | `POST` | `/opaque/sign-in/complete` | none |
-| Change password | `POST` | `/opaque/change-password/challenge` | fresh session |
-| Change password | `POST` | `/opaque/change-password/complete` | fresh session |
-| Set password | `POST` | `/opaque/set-password/challenge` | fresh session |
-| Set password | `POST` | `/opaque/set-password/complete` | fresh session |
-| Reset password | `POST` | `/opaque/reset-password/request` | none |
-| Reset password | `GET` | `/opaque/reset-password/:token` | none (redirects to `callbackURL?token=`) |
-| Reset password | `POST` | `/opaque/reset-password/challenge` | reset token |
-| Reset password | `POST` | `/opaque/reset-password/complete` | reset token |
-
-The `state` value each challenge returns is an encrypted, purpose-bound, single-use blob. The complete step must present it within `challengeExpiresIn` seconds. Each challenge also writes one row to Better Auth's `verification` table, which the complete step consumes; rows for abandoned challenges are purged with Better Auth's normal expired-verification cleanup.
+[docs/reference.md](docs/reference.md) lists every [option](docs/reference.md#options), [endpoint](docs/reference.md#endpoints) and [error code](docs/reference.md#error-codes).
 
 ## Security
 
-**What OPAQUE gives you.** Passwords are never transmitted or stored. A database breach yields registration records that cannot be brute-forced offline without also stealing `OPAQUE_SERVER_KEY`, and even then each guess costs a full Argon2 evaluation. The server cannot be tricked into revealing anything about the password by a malicious client.
+**What OPAQUE gives you.** Passwords are never transmitted or stored. A database breach yields registration records that cannot be brute-forced offline without also stealing the server setup (`serverSetup`), and even then each guess costs a full Argon2 evaluation. The server cannot be tricked into revealing anything about the password by a malicious client.
 
 **What it does not give you.** Online guessing is still possible. Each guess costs the attacker one challenge request plus client-side Argon2, and the plugin rate limits every endpoint, but there is no per-account lockout. A wrong password is decided on the client, so the server never observes failed attempts; add a CAPTCHA or per-email throttle in front of the sign-in challenge if that matters for you.
 
-**Account enumeration.** The sign-in challenge for an unknown email is computed under a fake record with a deterministic credential id, performs the same database queries as the real path, and returns a response of identical shape and size. Sign-up and reset-password requests respond identically for known and unknown emails. This only holds if the rest of your configuration does too: Better Auth's own `/sign-up/email` reveals existing emails by default, so either keep `emailAndPassword` disabled or configure it to respond generically. Debug logs never include the email or whether it exists.
+**Account enumeration.** The sign-in challenge for an unknown email is computed under a fake record with a deterministic credential id, performs the same database queries as the real path, and returns a response of identical shape and size. Sign-up and reset-password requests respond identically for known and unknown emails. The exception is an additional user field with a database `unique` constraint: the insert fails only for new emails, so sign-up completion tells them apart; keep such fields out of sign-up or set them after sign-in. This only holds if the rest of your configuration does too: Better Auth's own `/sign-up/email` reveals existing emails by default, so either keep `emailAndPassword` disabled or configure it to respond generically. Debug logs never include the email or whether it exists.
 
-**Timing.** The matched-work design keeps the real and fake branches within tens of microseconds of each other, well under network jitter, which is the same approach Better Auth core takes for `/sign-in/email`. If your write path is much slower than your read path you can additionally set `timingSafeResponseMs` to pad the sign-in challenge, sign-up completion and reset request to a floor. Set it to roughly 2 to 3 times your p99 handler time. It is a backstop, not constant time: a request that overruns the floor leaks its real duration.
+**Timing.** On the sign-in challenge, the matched-work design keeps the real and fake-record branches within tens of microseconds of each other, well under network jitter, which is the same approach Better Auth core takes for `/sign-in/email`. Sign-up completion and reset request have no fake branch: for a new email or a known account they do extra database writes, sub-millisecond on a local database and more on a networked one. To hide that, set `timingSafeResponseMs` to pad the sign-in challenge, sign-up completion and reset request to a floor of roughly 2 to 3 times your p99 handler time. It is a backstop, not constant time: a request that overruns the floor leaks its real duration.
 
 **Handshake state.** The state blob handed to the client between the two steps is encrypted with the Better Auth secret, padded to a fixed size, bound to its purpose (sign-in state cannot complete a password change), expires after `challengeExpiresIn` seconds, and can be completed exactly once. Consumption is atomic (Better Auth's `consumeVerificationValue`), so concurrent requests carrying the same state, or the same reset token, cannot both succeed. A challenge minted before a password change cannot complete after it.
 
-**Email changes.** Records are bound to a server-generated credential id, not the email, so `changeEmail` and case differences in the typed email do not lock anyone out.
+**Email changes.** Records are bound to a server-generated credential id, not the email, so `changeEmail` and case differences in the typed email do not lock anyone out. Accounts still on a 2.x record are the exception until their password is changed or reset; see [Upgrading](#upgrading-from-2x).
 
 **Two-factor.** The Better Auth `twoFactor` plugin hooks only the core sign-in routes, so an OPAQUE sign-in currently completes without the second factor. If you need both, enforce the second factor in your own `databaseHooks.session.create.before` or in front of the session.
 
@@ -276,18 +244,19 @@ The `state` value each challenge returns is an encrypted, purpose-bound, single-
 
 ## Upgrading from 2.x
 
-3.0.0 is a breaking release. Most apps only need to upgrade `better-auth`, rerun migrations and rename `changePassword`.
+3.0.0 is a breaking release. Most apps only need to rerun migrations and rename `changePassword`, plus upgrade `better-auth` if they are coming from 2.0.x.
 
-* **`better-auth` 1.7 or newer is required.** The plugin now declares it as a peer dependency instead of bundling its own copy, which also fixes the `Types of property 'getActions' are incompatible` / `Property 'opaque' does not exist` errors apps hit when their `better-auth` and the plugin's copy diverged. If those persist, run `npm ls better-auth @better-fetch/fetch` and dedupe.
-* **New `account.credentialId` column.** Run your migration. Records written by 2.x keep working through a fallback, except that 2.x bound records to the exact email casing typed at sign-up: users who registered with mixed-case emails under 2.x must reset their password.
+* **`better-auth` 1.7 or newer is required** as a peer dependency, as in 2.1.0 (2.0.x bundled 1.3). The `Types of property 'getActions' are incompatible` / `Property 'opaque' does not exist` errors from 2.0.3 are gone: its published types gave `getActions` a `$fetch` typed as `BetterFetch` from `@better-fetch/fetch`, typed structurally since 2.1.0.
+* **New `account.credentialId` column.** Run your migration. Records written by 2.x keep working through a fallback until the password is changed or reset, which moves the account to a credential id. 2.x bound each record to the email exactly as it was typed at sign-up, so those users must sign in with that same casing; any other casing fails with `INVALID_EMAIL_OR_PASSWORD`. Change-password on a 2.x account uses the stored, lower-cased email, so a 2.x user who registered in mixed case must reset their password rather than change it.
 * **`authClient.changePassword` is now `authClient.opaque.changePassword`.** The old name refers to Better Auth's built-in action.
+* **Change password requires a fresh session** (2.1.0 accepted any session), and by default it now issues this device a new session instead of signing it out with every other one.
 * **Endpoints moved** from `/sign-up/opaque/*`, `/sign-in/opaque/*` and `/opaque/changePassword/*` to `/opaque/sign-up/*`, `/opaque/sign-in/*` and `/opaque/change-password/*`. Only custom clients are affected.
-* **Response shapes** now match core: sign-in and change-password return `{ token, user }`, sign-up returns `{ status, token }`. The client adds `exportKey`, `sessionKey`, `previousExportKey` and `serverPublicKey` where they apply.
+* **Response shapes** now match core: sign-in returns `{ redirect: false, token, user }`, change-password `{ token, user }`, sign-up `{ status, token }`. The client adds `exportKey`, `sessionKey`, `previousExportKey` and `serverPublicKey` where they apply.
 * **`dontRememberMe` is now `rememberMe`**, same semantics as `signIn.email`.
-* **The timing floor is off by default.** 2.x padded every endpoint to 250 ms. Set `timingSafeResponseMs` explicitly if you want it back.
 * **Challenges expire after 2 minutes and are single-use** (2.x: 15 minutes, replayable).
 * **Email verification is honoured.** If `requireEmailVerification` is set, unverified users can no longer sign in with OPAQUE.
-* `OPAQUE_SERVER_KEY` is required when `NODE_ENV=production`.
+* **`OPAQUE_SERVER_KEY` is now `serverSetup`.** The old name still works as a deprecated alias. One of them is required unless `NODE_ENV` is `development` or `test`; 2.x generated and printed a throwaway key in any environment.
+* **Rate limits** now apply to every `/opaque/*` endpoint; see [Endpoints](docs/reference.md#endpoints).
 
 ## Development
 
@@ -296,14 +265,14 @@ bun install
 bun run typecheck    # tsc over src/ and tests/ (the type-level tests only bite here)
 bun run build        # tsc -> dist/
 bun run test         # vitest on better-auth's HTTP test instance, run under bun
-bun run check        # all three, which is also what CI and prepublishOnly run
+bun run check        # all three; run by the release workflow and prepublishOnly
 bun run test:timing  # opt-in statistical timing tests (slow)
 bun run test:server  # manual Express server on :8080
 ```
 
 Tests use `better-auth/test`, which needs `node:sqlite` with `StatementSync.columns()`. That ships in Bun and in Node 22.16+/23.11+; `bun run test:node` runs the suite on plain Node if yours is new enough.
 
-Releases: publishing a GitHub release runs the `release` workflow, which re-runs `bun run check` and publishes to npm with provenance. It needs an npm automation token in the `NPM_TOKEN` repository secret.
+Releases: publishing a GitHub release runs the `release` workflow in the `release` environment. It checks that the tag matches the `package.json` version, runs `bun run check` once, then publishes to npm with provenance and `--ignore-scripts`. It needs an npm token in the `NPM_TOKEN` secret.
 
 ## License
 
