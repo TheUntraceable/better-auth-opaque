@@ -1,4 +1,4 @@
-export { opaqueClient, OPAQUE_ERROR_CODES } from "./client";
+export { OpaqueFetchError, opaqueClient, OPAQUE_ERROR_CODES } from "./client";
 export type {
 	OpaqueClientError,
 	OpaqueClientOptions,

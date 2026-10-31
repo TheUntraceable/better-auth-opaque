@@ -44,13 +44,16 @@ describe("opaque: sign-up and sign-in", () => {
 	test("a callbackURL never turns the response into a redirect", async () => {
 		const email = uniqueEmail("callback");
 		await t.client.signUp.opaque({ email, name: "Callback", password });
+		const locations: (string | null)[] = [];
 		const signIn = await t.client.signIn.opaque(
 			{ email, password, callbackURL: "/dashboard" },
+			{ onResponse: ({ response }) => void locations.push(response.headers.get("location")) },
 		);
 		expect(signIn.error).toBeNull();
 		expect(signIn.data?.token).toBeTruthy();
 		expect(signIn.data?.redirect).toBe(false);
 		expect(signIn.data).not.toHaveProperty("url");
+		expect(locations).toEqual([null]);
 	});
 
 	test("signs in a 2.x account only with the email exactly as it registered", async () => {
@@ -101,9 +104,17 @@ describe("opaque: sign-up and sign-in", () => {
 	test("rejects a wrong password on the client without sending a proof", async () => {
 		const email = uniqueEmail("wrong");
 		await t.client.signUp.opaque({ email, name: "Wrong", password });
+		const paths: string[] = [];
 		const result = await t.client.signIn.opaque(
 			{ email, password: "nope-nope-nope" },
+			{
+				customFetchImpl: (input, init) => {
+					paths.push(new URL(String(input)).pathname);
+					return fetch(input, init);
+				},
+			},
 		);
+		expect(paths).toEqual(["/api/auth/opaque/sign-in/challenge"]);
 		expect(result.data).toBeNull();
 		expect(result.error?.code).toBe("INVALID_EMAIL_OR_PASSWORD");
 		expect(result.error?.status).toBe(401);
@@ -339,6 +350,27 @@ describe("opaque: sign-up and sign-in", () => {
 		});
 		expect(result.error).toBeNull();
 		expect(setCookies.join("\n")).toContain("dont_remember");
+	});
+
+	test("disableSignal suppresses the session signal like core actions do", async () => {
+		const email = uniqueEmail("nosignal");
+		await t.client.signUp.opaque({ email, name: "Quiet", password });
+		let notified = 0;
+		const unlisten = t.client.$store.atoms.$sessionSignal!.listen(() => {
+			notified++;
+		});
+		try {
+			const quiet = await t.client.signIn.opaque({ email, password }, { disableSignal: true });
+			expect(quiet.error).toBeNull();
+			expect(quiet.data?.token).toBeTruthy();
+			expect(notified).toBe(0);
+
+			const loud = await t.client.signIn.opaque({ email, password });
+			expect(loud.error).toBeNull();
+			expect(notified).toBe(1);
+		} finally {
+			unlisten();
+		}
 	});
 
 	test("accepts additional user fields on sign-up", async () => {
