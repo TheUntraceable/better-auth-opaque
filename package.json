@@ -11,7 +11,7 @@
 		"rfc9807",
 		"authentication",
 		"password",
-		"zero-knowledge",
+		"password-authenticated-key-exchange",
 		"end-to-end-encryption"
 	],
 	"license": "MIT",
@@ -45,7 +45,8 @@
 	"files": [
 		"dist",
 		"README.md",
-		"LICENSE.md"
+		"LICENSE.md",
+		"docs/reference.md"
 	],
 	"sideEffects": false,
 	"scripts": {
