@@ -13,6 +13,8 @@ export const TEST_OPAQUE_SERVER_KEY =
 export const TEST_OPAQUE_PUBLIC_KEY = () =>
 	server.getPublicKey(TEST_OPAQUE_SERVER_KEY);
 
+export const password = "supersecurepassword";
+
 export const uniqueEmail = (prefix: string) =>
 	`${prefix}-${crypto.randomUUID()}@untraceable.dev`;
 

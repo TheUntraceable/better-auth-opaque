@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { decryptState, encryptState } from "../src/utils";
+import { decryptState, encryptState } from "../src/server/state";
 
 const secret = "supersecretkey";
 
