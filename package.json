@@ -1,14 +1,45 @@
 {
 	"name": "better-auth-opaque",
-	"version": "2.1.0",
+	"version": "3.0.0",
+	"description": "OPAQUE (RFC 9807) password authentication for Better Auth: the password never leaves the device, and every login hands the client an export key the server never learns.",
+	"keywords": [
+		"better-auth",
+		"better-auth-plugin",
+		"opaque",
+		"pake",
+		"apake",
+		"rfc9807",
+		"authentication",
+		"password",
+		"zero-knowledge",
+		"end-to-end-encryption"
+	],
+	"license": "MIT",
+	"author": "Ridhwan Hussain",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/TheUntraceable/better-auth-opaque.git"
+	},
+	"homepage": "https://github.com/TheUntraceable/better-auth-opaque#readme",
+	"bugs": {
+		"url": "https://github.com/TheUntraceable/better-auth-opaque/issues"
+	},
 	"type": "module",
 	"main": "./dist/index.js",
 	"module": "./dist/index.js",
 	"types": "./dist/index.d.ts",
 	"exports": {
 		".": {
-			"import": "./dist/index.js",
-			"types": "./dist/index.d.ts"
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./client": {
+			"types": "./dist/client.d.ts",
+			"default": "./dist/client.js"
+		},
+		"./server": {
+			"types": "./dist/server.d.ts",
+			"default": "./dist/server.js"
 		}
 	},
 	"files": [
@@ -16,24 +47,31 @@
 		"README.md",
 		"LICENSE.md"
 	],
+	"sideEffects": false,
 	"scripts": {
 		"build": "tsc",
 		"typecheck": "tsc -p tsconfig.test.json",
-		"prepublishOnly": "npm run build"
+		"test": "bunx --bun vitest run",
+		"test:node": "vitest run",
+		"test:timing": "cross-env OPAQUE_TIMING_TESTS=1 bunx --bun vitest run tests/timing/ --no-file-parallelism",
+		"test:server": "bun tests/server.ts",
+		"check": "bun run typecheck && bun run build && bun run test",
+		"prepublishOnly": "bun run check"
 	},
 	"devDependencies": {
 		"@types/bun": "latest",
 		"@types/express": "^5.0.6",
 		"@types/morgan": "^1.9.10",
-		"better-auth": "^1.7.6",
+		"better-auth": "1.7.14",
+		"cross-env": "^10.1.0",
 		"express": "^5.2.1",
 		"morgan": "^1.12.1",
 		"typescript": "^7.0.2",
+		"vitest": "^5.0.5",
 		"zod": "^4.6.5"
 	},
 	"peerDependencies": {
 		"better-auth": "^1.7.0",
-		"typescript": ">=5",
 		"zod": "^4"
 	},
 	"dependencies": {

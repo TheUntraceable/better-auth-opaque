@@ -4,7 +4,8 @@ import express from "express";
 import morgan from "morgan";
 import { opaque } from "../src/server";
 
-
+// Manual playground: `bun run test:server`, then point a client at :8080.
+// The fallback key is the suite's throwaway test key; never reuse it.
 const auth = betterAuth({
 	emailAndPassword: {
 		enabled: true,
@@ -12,6 +13,7 @@ const auth = betterAuth({
 	plugins: [
 		opaque({
 			OPAQUE_SERVER_KEY:
+				process.env.OPAQUE_SERVER_KEY ??
 				"bgTA0wwx_5WvwoyDHURXOsnN3u1y2uJLr1vXYGc1_F5yNgubuj6Pf4JVIM83aIWHHJ7GIPUxDW74-j8CEuv0Os4rE4lQ7GnBQk3nVLDl5s1J4BsNrPXqx_i-T44FaZYLQPDzr2huMv49zUIRxA15XVU9dFuzZZgf-XiaaNDnIA0",
 		}),
 	],
