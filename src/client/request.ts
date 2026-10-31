@@ -63,27 +63,9 @@ export const fail = (
 	error: { ...OPAQUE_ERROR_CODES[code], status, statusText },
 });
 
-const unwrap = <T>(result: {
-	data: T | null;
-	error: OpaqueClientError | null;
-}): OpaqueResult<T> => {
-	if (result.error) return { data: null, error: result.error };
-	if (result.data === null || result.data === undefined) {
-		return fail("REQUEST_FAILED", 500, "Internal Server Error");
-	}
-	return { data: result.data, error: null };
-};
-
-const notifySession = (
-	$store: OpaqueClientStore,
-	fetchOptions: OpaqueFetchOptions,
-) => {
-	if (!fetchOptions.disableSignal) $store.notify("$sessionSignal");
-};
-
 // The caller's onRequest runs once per action, yet a header it adds is meant
 // for the whole action, so it is replayed on every later request.
-const onFirstRequest = (
+const replayFirstRequestHeaders = (
 	onRequest: OpaqueFetchOptions["onRequest"],
 ): ((request: RequestContext) => Promise<RequestContext>) | undefined => {
 	if (!onRequest) return undefined;
@@ -101,15 +83,6 @@ const onFirstRequest = (
 		return next;
 	};
 };
-
-// A failure decided on the client has no response of its own. The hooks get
-// one carrying the error so `response.status` agrees with `error.status`.
-const rejection = (error: OpaqueClientError) =>
-	new Response(JSON.stringify({ code: error.code, message: error.message }), {
-		status: error.status,
-		statusText: error.statusText,
-		headers: { "content-type": "application/json" },
-	});
 
 export const createRequester = (
 	$fetch: OpaqueFetch,
@@ -139,7 +112,7 @@ export const createRequester = (
 			throw: shouldThrow = config?.fetchOptions?.throw ?? false,
 			...transport
 		} = fetchOptions;
-		const requestHook = onFirstRequest(onRequest);
+		const requestHook = replayFirstRequestHeaders(onRequest);
 		const latest: {
 			exchange?: ResponseContext;
 			serverError?: OpaqueClientError | null;
@@ -162,21 +135,30 @@ export const createRequester = (
 					};
 				},
 			});
-			const outcome = unwrap(result);
 			latest.serverError = result.error;
-			return outcome;
+			if (result.error) return { data: null, error: result.error };
+			if (result.data === null || result.data === undefined) {
+				return fail("REQUEST_FAILED", 500, "Internal Server Error");
+			}
+			return { data: result.data, error: null };
 		};
 
 		const outcome = await flow(post);
-		const decidedOnClient =
-			outcome.error !== null && outcome.error !== latest.serverError;
-		const settled =
-			latest.exchange && decidedOnClient
-				? {
-						request: latest.exchange.request,
-						response: rejection(outcome.error),
-					}
-				: latest.exchange;
+		let settled = latest.exchange;
+		// A failure decided on the client has no response of its own. The hooks
+		// get one carrying the error so `response.status` agrees with
+		// `error.status`.
+		if (settled && outcome.error && outcome.error !== latest.serverError) {
+			const { code, message, status, statusText } = outcome.error;
+			settled = {
+				request: settled.request,
+				response: new Response(JSON.stringify({ code, message }), {
+					status,
+					statusText,
+					headers: { "content-type": "application/json" },
+				}),
+			};
+		}
 		if (settled) {
 			await onResponse?.(settled);
 			if (outcome.error) {
@@ -190,16 +172,17 @@ export const createRequester = (
 		}
 		if (outcome.error) {
 			if (shouldThrow) throw new OpaqueFetchError(outcome.error);
-		} else if (signalsSession(outcome.data)) {
-			notifySession($store, fetchOptions);
+		} else if (signalsSession(outcome.data) && !fetchOptions.disableSignal) {
+			$store.notify("$sessionSignal");
 		}
 		return outcome;
 	};
 
 	/**
-	 * Registration round trip shared by sign-up, change-password,
-	 * set-password and reset-password. Returns the record to send plus
-	 * the export key the app may keep.
+	 * Registration round trip shared by sign-up, set-password and
+	 * reset-password. Change-password runs its own because it carries the
+	 * registration in the same request as its login. Returns the record to
+	 * send plus the export key the app may keep.
 	 */
 	const register = async (
 		password: string,
