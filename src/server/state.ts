@@ -1,10 +1,11 @@
-import { APIError } from "better-auth";
+import { APIError, type GenericEndpointContext } from "better-auth";
 import {
 	generateRandomString,
 	symmetricDecrypt,
 	symmetricEncrypt,
 } from "better-auth/crypto";
 import { OPAQUE_ERROR_CODES } from "../error-codes";
+import type { LoginIdentity } from "./account";
 
 export const PURPOSE = {
 	signUp: "sign-up",
@@ -14,29 +15,49 @@ export const PURPOSE = {
 	resetPassword: "reset-password",
 } as const;
 
+export type Purpose = (typeof PURPOSE)[keyof typeof PURPOSE];
+
+export type StatePayload =
+	| { purpose: typeof PURPOSE.signUp; email: string; credentialId: string }
+	| (LoginIdentity & {
+			purpose: typeof PURPOSE.signIn;
+			serverLoginState: string;
+			userId: string | null;
+	  })
+	| (LoginIdentity & {
+			purpose: typeof PURPOSE.changePassword;
+			serverLoginState: string;
+			userId: string;
+			newCredentialId: string;
+	  })
+	| {
+			purpose: typeof PURPOSE.setPassword;
+			userId: string;
+			newCredentialId: string;
+	  }
+	| {
+			purpose: typeof PURPOSE.resetPassword;
+			userId: string;
+			newCredentialId: string;
+			token: string;
+	  };
+
 /**
  * Everything the server needs to finish a handshake lives in this blob,
  * handed to the client between the challenge and complete steps. It is
  * AEAD-encrypted under the auth secret, bound to a purpose so a sign-in
  * state cannot be replayed into change-password, and (via `stateId`)
- * consumed exactly once.
+ * consumed exactly once. Only the server can mint it, so once the purpose
+ * matches, the fields are the ones that purpose was issued with.
  */
-export interface OpaqueState {
-	purpose: string;
-	stateId: string;
-	issuedAt: number;
-	serverLoginState?: string;
-	userId?: string | null;
-	email?: string;
-	credentialId?: string;
-	newCredentialId?: string;
-	token?: string;
-}
+export type OpaqueState = StatePayload & { stateId: string; issuedAt: number };
+
+export type StateFor<P extends Purpose> = Extract<OpaqueState, { purpose: P }>;
 
 // Fixed-length ciphertext so the state's size never reveals which branch
 // produced it. Large enough for every purpose above with headroom.
 const STATE_PADDED_LENGTH = 1024;
-export const encoder = new TextEncoder();
+const encoder = new TextEncoder();
 
 function padToLength(input: string, length: number): string {
 	const byteLength = encoder.encode(input).length;
@@ -58,13 +79,13 @@ export async function encryptState(
 	});
 }
 
-export async function decryptState(
+export async function decryptState<P extends Purpose>(
 	encrypted: string,
 	secret: string,
-	expectedPurpose: string,
+	expectedPurpose: P,
 	maxAgeMs: number,
-): Promise<OpaqueState> {
-	let state: OpaqueState;
+): Promise<StateFor<P>> {
+	let state: Partial<OpaqueState> | null;
 	try {
 		state = JSON.parse(
 			(await symmetricDecrypt({ key: secret, data: encrypted })).trimEnd(),
@@ -84,35 +105,21 @@ export async function decryptState(
 	) {
 		throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_LOGIN_STATE);
 	}
-	return state;
+	return state as StateFor<P>;
 }
 
 const stateIdentifier = (stateId: string) => `opaque-state:${stateId}`;
 
-type Ctx = {
-	context: {
-		secret: string;
-		internalAdapter: {
-			createVerificationValue: (data: {
-				identifier: string;
-				value: string;
-				expiresAt: Date;
-			}) => Promise<unknown>;
-			consumeVerificationValue: (
-				identifier: string,
-			) => Promise<{ value: string; expiresAt: Date } | null | undefined>;
-		};
-	};
-};
-
 export const createStateStore = (challengeTtlMs: number) => ({
-	// Issue a one-time, purpose-bound state. The stateId is recorded so the
-	// complete step can consume it exactly once.
-	issueState: async (
-		ctx: Ctx,
-		data: Omit<OpaqueState, "stateId" | "issuedAt">,
-	) => {
+	// The encrypted blob alone is replayable; the marker row is what makes it single-use.
+	issueState: async (ctx: GenericEndpointContext, data: StatePayload) => {
 		const stateId = generateRandomString(32);
+		// Core purges expired rows only in findVerificationValue, not in
+		// consumeVerificationValue, and abandoned challenges never reach complete;
+		// looking up the fresh id runs that purge with its hooks and disableCleanup.
+		await ctx.context.internalAdapter.findVerificationValue(
+			stateIdentifier(stateId),
+		);
 		await ctx.context.internalAdapter.createVerificationValue({
 			identifier: stateIdentifier(stateId),
 			value: data.purpose,
@@ -124,11 +131,13 @@ export const createStateStore = (challengeTtlMs: number) => ({
 		);
 	},
 
-	// Decrypt a state and burn its one-time marker. The marker is consumed
-	// atomically (better-auth's consumeVerificationValue), so two requests
-	// racing with the same state cannot both pass; it also returns null for
-	// an expired row, so there is no separate expiry check to get wrong.
-	consumeState: async (ctx: Ctx, encrypted: string, purpose: string) => {
+	// consumeVerificationValue is atomic, so racing requests cannot both pass,
+	// and it returns null for an expired row, hence no expiry check here.
+	consumeState: async <P extends Purpose>(
+		ctx: GenericEndpointContext,
+		encrypted: string,
+		purpose: P,
+	) => {
 		const decoded = await decryptState(
 			encrypted,
 			ctx.context.secret,

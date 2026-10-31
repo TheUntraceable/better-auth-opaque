@@ -2,17 +2,19 @@ import { server } from "@serenity-kit/opaque";
 import { APIError } from "better-auth";
 import {
 	createAuthEndpoint,
+	freshSessionMiddleware,
 	sensitiveSessionMiddleware,
 } from "better-auth/api";
-import { setSessionCookie } from "better-auth/cookies";
 import { generateRandomString } from "better-auth/crypto";
 import { parseUserOutput } from "better-auth/db";
 import * as z from "zod";
 import { OPAQUE_ERROR_CODES } from "../error-codes";
 import {
 	assertValidRegistrationRecord,
-	credentialIdFor,
 	findOpaqueAccount,
+	loginIdentity,
+	matchesLoginIdentity,
+	saveOpaqueRecord,
 } from "./account";
 import {
 	loginRequest,
@@ -24,9 +26,16 @@ import {
 } from "./shared";
 import { PURPOSE } from "./state";
 
+// sensitiveSessionMiddleware re-reads the session from the store but ignores
+// session.freshAge; freshSessionMiddleware then applies core's freshness
+// check to the session the first one put on the context.
+const freshSensitiveSession = [
+	sensitiveSessionMiddleware,
+	freshSessionMiddleware,
+];
+
 export const passwordEndpoints = (shared: Shared) => {
-	const { requireSetup, issueState, consumeState, finishLoginOrThrow } =
-		shared;
+	const { issueState, consumeState, finishLogin, issueSession } = shared;
 
 	return {
 		opaqueChangePasswordChallenge: createAuthEndpoint(
@@ -38,7 +47,7 @@ export const passwordEndpoints = (shared: Shared) => {
 					loginRequest,
 					registrationRequest,
 				}),
-				use: [sensitiveSessionMiddleware],
+				use: freshSensitiveSession,
 				metadata: {
 					isAction: false,
 					openapi: {
@@ -48,7 +57,6 @@ export const passwordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const setup = requireSetup();
 				const user = ctx.context.session.user;
 				const account = await findOpaqueAccount(ctx, user.id);
 				if (!account?.registrationRecord) {
@@ -57,17 +65,23 @@ export const passwordEndpoints = (shared: Shared) => {
 						OPAQUE_ERROR_CODES.NO_OPAQUE_ACCOUNT,
 					);
 				}
-				const credentialId = credentialIdFor(account, user.email);
+				// No email in this request, so a 2.x record gets the stored one, as
+				// 2.x itself used; one registered in mixed case needs a reset.
+				const identity = await loginIdentity(
+					account,
+					account.registrationRecord,
+					user.email,
+				);
 				const newCredentialId = generateRandomString(32);
 
 				const { loginResponse, serverLoginState } = server.startLogin({
-					serverSetup: setup,
-					userIdentifier: credentialId,
+					serverSetup: shared.serverSetup,
+					userIdentifier: identity.credentialId,
 					registrationRecord: account.registrationRecord,
 					startLoginRequest: ctx.body.loginRequest,
 				});
 				const { registrationResponse } = server.createRegistrationResponse({
-					serverSetup: setup,
+					serverSetup: shared.serverSetup,
 					userIdentifier: newCredentialId,
 					registrationRequest: ctx.body.registrationRequest,
 				});
@@ -75,7 +89,7 @@ export const passwordEndpoints = (shared: Shared) => {
 					purpose: PURPOSE.changePassword,
 					serverLoginState,
 					userId: user.id,
-					credentialId,
+					...identity,
 					newCredentialId,
 				});
 				return {
@@ -97,7 +111,7 @@ export const passwordEndpoints = (shared: Shared) => {
 					state,
 					revokeOtherSessions: z.boolean().optional(),
 				}),
-				use: [sensitiveSessionMiddleware],
+				use: freshSensitiveSession,
 				metadata: {
 					isAction: false,
 					openapi: {
@@ -107,47 +121,40 @@ export const passwordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const setup = requireSetup();
 				const sessionUser = ctx.context.session.user;
 				const decoded = await consumeState(
 					ctx,
 					ctx.body.state,
 					PURPOSE.changePassword,
 				);
-				if (
-					decoded.userId !== sessionUser.id ||
-					!decoded.serverLoginState ||
-					!decoded.newCredentialId
-				) {
+				if (decoded.userId !== sessionUser.id) {
 					throw APIError.from(
 						"UNAUTHORIZED",
 						OPAQUE_ERROR_CODES.USER_MISMATCH,
 					);
 				}
 				const account = await findOpaqueAccount(ctx, sessionUser.id);
-				if (
-					!account ||
-					credentialIdFor(account, sessionUser.email) !== decoded.credentialId
-				) {
+				if (!account || !(await matchesLoginIdentity(account, decoded))) {
 					throw APIError.from(
 						"BAD_REQUEST",
 						OPAQUE_ERROR_CODES.INVALID_LOGIN_STATE,
 					);
 				}
-				finishLoginOrThrow(
+				finishLogin(
 					ctx.body.loginResult,
 					decoded.serverLoginState,
 					OPAQUE_ERROR_CODES.INVALID_PASSWORD,
 				);
 				await assertValidRegistrationRecord(
-					setup,
+					shared.serverSetup,
 					decoded.newCredentialId,
 					ctx.body.registrationRecord,
 				);
-				await ctx.context.internalAdapter.updateAccount(account.id, {
+				await saveOpaqueRecord(ctx, account, {
+					userId: sessionUser.id,
 					registrationRecord: ctx.body.registrationRecord,
 					credentialId: decoded.newCredentialId,
-				} as Parameters<typeof ctx.context.internalAdapter.updateAccount>[1]);
+				});
 
 				const user = await ctx.context.internalAdapter.findUserById(
 					sessionUser.id,
@@ -160,17 +167,7 @@ export const passwordEndpoints = (shared: Shared) => {
 				}
 				if (ctx.body.revokeOtherSessions !== false) {
 					await ctx.context.internalAdapter.deleteUserSessions(user.id);
-					const session = await ctx.context.internalAdapter.createSession(
-						user.id,
-						false,
-					);
-					if (!session) {
-						throw APIError.from(
-							"INTERNAL_SERVER_ERROR",
-							OPAQUE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
-						);
-					}
-					await setSessionCookie(ctx, { session, user });
+					const session = await issueSession(ctx, user, false);
 					return {
 						token: session.token,
 						user: parseUserOutput(ctx.context.options, user),
@@ -189,7 +186,7 @@ export const passwordEndpoints = (shared: Shared) => {
 				method: "POST",
 				requireHeaders: true,
 				body: z.object({ registrationRequest }),
-				use: [sensitiveSessionMiddleware],
+				use: freshSensitiveSession,
 				metadata: {
 					isAction: false,
 					openapi: {
@@ -199,7 +196,6 @@ export const passwordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const setup = requireSetup();
 				const user = ctx.context.session.user;
 				const account = await findOpaqueAccount(ctx, user.id);
 				if (account?.registrationRecord) {
@@ -210,7 +206,7 @@ export const passwordEndpoints = (shared: Shared) => {
 				}
 				const newCredentialId = generateRandomString(32);
 				const { registrationResponse } = server.createRegistrationResponse({
-					serverSetup: setup,
+					serverSetup: shared.serverSetup,
 					userIdentifier: newCredentialId,
 					registrationRequest: ctx.body.registrationRequest,
 				});
@@ -229,7 +225,7 @@ export const passwordEndpoints = (shared: Shared) => {
 				method: "POST",
 				requireHeaders: true,
 				body: z.object({ registrationRecord, state }),
-				use: [sensitiveSessionMiddleware],
+				use: freshSensitiveSession,
 				metadata: {
 					isAction: false,
 					openapi: {
@@ -238,21 +234,20 @@ export const passwordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const setup = requireSetup();
 				const user = ctx.context.session.user;
 				const decoded = await consumeState(
 					ctx,
 					ctx.body.state,
 					PURPOSE.setPassword,
 				);
-				if (decoded.userId !== user.id || !decoded.newCredentialId) {
+				if (decoded.userId !== user.id) {
 					throw APIError.from(
 						"UNAUTHORIZED",
 						OPAQUE_ERROR_CODES.USER_MISMATCH,
 					);
 				}
 				await assertValidRegistrationRecord(
-					setup,
+					shared.serverSetup,
 					decoded.newCredentialId,
 					ctx.body.registrationRecord,
 				);
@@ -263,22 +258,11 @@ export const passwordEndpoints = (shared: Shared) => {
 						OPAQUE_ERROR_CODES.OPAQUE_ACCOUNT_EXISTS,
 					);
 				}
-				if (existing) {
-					await ctx.context.internalAdapter.updateAccount(existing.id, {
-						registrationRecord: ctx.body.registrationRecord,
-						credentialId: decoded.newCredentialId,
-					} as Parameters<typeof ctx.context.internalAdapter.updateAccount>[1]);
-				} else {
-					await ctx.context.internalAdapter.createAccount({
-						providerId: "opaque",
-						accountId: user.id,
-						userId: user.id,
-						registrationRecord: ctx.body.registrationRecord,
-						credentialId: decoded.newCredentialId,
-					} as Parameters<
-						typeof ctx.context.internalAdapter.createAccount
-					>[0]);
-				}
+				await saveOpaqueRecord(ctx, existing, {
+					userId: user.id,
+					registrationRecord: ctx.body.registrationRecord,
+					credentialId: decoded.newCredentialId,
+				});
 				return { status: true };
 			},
 		),

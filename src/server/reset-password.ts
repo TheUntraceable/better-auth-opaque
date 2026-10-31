@@ -4,7 +4,11 @@ import { createAuthEndpoint, originCheck } from "better-auth/api";
 import { generateRandomString } from "better-auth/crypto";
 import * as z from "zod";
 import { OPAQUE_ERROR_CODES } from "../error-codes";
-import { assertValidRegistrationRecord, findOpaqueAccount } from "./account";
+import {
+	assertValidRegistrationRecord,
+	findOpaqueAccount,
+	saveOpaqueRecord,
+} from "./account";
 import {
 	enforceMinimumDuration,
 	normalizeEmail,
@@ -18,15 +22,8 @@ import { PURPOSE } from "./state";
 const resetIdentifier = (token: string) => `opaque-reset:${token}`;
 
 export const resetPasswordEndpoints = (shared: Shared) => {
-	const {
-		options,
-		requireSetup,
-		issueState,
-		consumeState,
-		runHook,
-		resetTtlMs,
-		floorMs,
-	} = shared;
+	const { options, issueState, consumeState, runHook, resetTtlMs, floorMs } =
+		shared;
 
 	return {
 		opaqueRequestPasswordReset: createAuthEndpoint(
@@ -110,9 +107,10 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 					ctx.query.callbackURL || "/",
 					ctx.context.baseURL,
 				);
-				const verification = await ctx.context.internalAdapter.findVerificationValue(
-					resetIdentifier(token),
-				);
+				const verification =
+					await ctx.context.internalAdapter.findVerificationValue(
+						resetIdentifier(token),
+					);
 				if (!verification || verification.expiresAt < new Date()) {
 					target.searchParams.set("error", "INVALID_TOKEN");
 				} else {
@@ -139,16 +137,16 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const setup = requireSetup();
-				const verification = await ctx.context.internalAdapter.findVerificationValue(
-					resetIdentifier(ctx.body.token),
-				);
+				const verification =
+					await ctx.context.internalAdapter.findVerificationValue(
+						resetIdentifier(ctx.body.token),
+					);
 				if (!verification || verification.expiresAt < new Date()) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
 				const newCredentialId = generateRandomString(32);
 				const { registrationResponse } = server.createRegistrationResponse({
-					serverSetup: setup,
+					serverSetup: shared.serverSetup,
 					userIdentifier: newCredentialId,
 					registrationRequest: ctx.body.registrationRequest,
 				});
@@ -180,22 +178,19 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const setup = requireSetup();
 				const decoded = await consumeState(
 					ctx,
 					ctx.body.state,
 					PURPOSE.resetPassword,
 				);
 				const identifier = resetIdentifier(ctx.body.token);
-				const verification = await ctx.context.internalAdapter.findVerificationValue(
-					identifier,
-				);
+				const verification =
+					await ctx.context.internalAdapter.findVerificationValue(identifier);
 				if (
 					!verification ||
 					verification.expiresAt < new Date() ||
 					decoded.token !== ctx.body.token ||
-					decoded.userId !== verification.value ||
-					!decoded.newCredentialId
+					decoded.userId !== verification.value
 				) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
@@ -206,12 +201,14 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
 				await assertValidRegistrationRecord(
-					setup,
+					shared.serverSetup,
 					decoded.newCredentialId,
 					ctx.body.registrationRecord,
 				);
-				// Burn the token atomically before touching the record, so two
-				// resets racing with the same link cannot both write.
+				// Burned before the write, outside a transaction: joining the two needs
+				// runWithTransaction from @better-auth/core, not a declared dependency.
+				// If the write then fails the user needs a new reset email; burning
+				// after it would let two resets racing on one link both write.
 				if (
 					!(await ctx.context.internalAdapter.consumeVerificationValue(
 						identifier,
@@ -219,23 +216,11 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
-				const account = await findOpaqueAccount(ctx, user.id);
-				if (account) {
-					await ctx.context.internalAdapter.updateAccount(account.id, {
-						registrationRecord: ctx.body.registrationRecord,
-						credentialId: decoded.newCredentialId,
-					} as Parameters<typeof ctx.context.internalAdapter.updateAccount>[1]);
-				} else {
-					await ctx.context.internalAdapter.createAccount({
-						providerId: "opaque",
-						accountId: user.id,
-						userId: user.id,
-						registrationRecord: ctx.body.registrationRecord,
-						credentialId: decoded.newCredentialId,
-					} as Parameters<
-						typeof ctx.context.internalAdapter.createAccount
-					>[0]);
-				}
+				await saveOpaqueRecord(ctx, await findOpaqueAccount(ctx, user.id), {
+					userId: user.id,
+					registrationRecord: ctx.body.registrationRecord,
+					credentialId: decoded.newCredentialId,
+				});
 				await ctx.context.internalAdapter.deleteUserSessions(user.id);
 				return { status: true };
 			},
