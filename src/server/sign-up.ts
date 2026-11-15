@@ -27,6 +27,13 @@ export const signUpEndpoints = (shared: Shared) => {
 		createRegistrationResponse,
 	} = shared;
 
+	// Read per request: init decides it, after this factory has run.
+	const assertSignUpOpen = () => {
+		if (shared.signUpDisabled) {
+			throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.SIGN_UP_DISABLED);
+		}
+	};
+
 	return {
 		opaqueSignUpChallenge: createAuthEndpoint(
 			"/opaque/sign-up/challenge",
@@ -45,6 +52,7 @@ export const signUpEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
+				assertSignUpOpen();
 				const email = normalizeEmail(ctx.body.email);
 				// No lookup here: the challenge does not depend on whether the
 				// account exists, so there is nothing to hide.
@@ -87,6 +95,7 @@ export const signUpEndpoints = (shared: Shared) => {
 			async (ctx) => {
 				const started = performance.now();
 				try {
+					assertSignUpOpen();
 					const {
 						email: rawEmail,
 						name,

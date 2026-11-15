@@ -34,11 +34,6 @@ export const opaque = (options: OpaqueOptions = {}) => {
 					"[better-auth-opaque] insecureCreateSessionOnRegister is enabled: the sign-up endpoint can now reveal whether an email is registered.",
 				);
 			}
-			if (ctx.options.plugins?.some((plugin) => plugin.id === "two-factor")) {
-				ctx.logger.warn(
-					"[better-auth-opaque] The twoFactor plugin only guards core's sign-in routes: an OPAQUE sign-in issues a session without the second factor. Enforce it in databaseHooks.session.create.before if you need both.",
-				);
-			}
 			if (ctx.options.emailAndPassword?.enabled) {
 				ctx.logger.warn(
 					"[better-auth-opaque] emailAndPassword is enabled alongside OPAQUE. Core /reset-password and /set-password create a server-side password hash next to the OPAQUE record. Use opaque.requestPasswordReset / opaque.setPassword instead, or disable emailAndPassword.",
@@ -72,6 +67,7 @@ export const opaque = (options: OpaqueOptions = {}) => {
 			),
 			rule((path) => path.startsWith("/opaque/"), 10, 5),
 		],
+		hooks: { after: shared.afterHooks },
 		endpoints: {
 			...signUpEndpoints(shared),
 			...signInEndpoints(shared),

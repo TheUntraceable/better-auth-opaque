@@ -75,6 +75,7 @@ export const signInActions = ({ run, serverKeyMismatch }: Requester) => ({
 					error: null,
 				};
 			},
-			() => true,
+			// No token when the sign-in stopped for a second factor.
+			(data) => Boolean(data.token),
 		),
 });

@@ -29,6 +29,13 @@ export interface OpaqueOptions {
 	insecureCreateSessionOnRegister?: boolean | undefined;
 
 	/**
+	 * Refuse OPAQUE sign-up. Defaults to `emailAndPassword.disableSignUp`
+	 * from your auth config; set it to `false` to keep OPAQUE sign-up open
+	 * while core's email and password sign-up is closed.
+	 */
+	disableSignUp?: boolean | undefined;
+
+	/**
 	 * Minimum response time, in milliseconds, for the endpoints whose work
 	 * depends on whether an account exists (sign-in challenge, sign-up
 	 * completion, reset-password request).

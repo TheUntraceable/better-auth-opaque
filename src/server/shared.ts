@@ -19,6 +19,7 @@ import {
 	type StatePayload,
 	stateIdentifier,
 } from "./state.js";
+import { type AfterHook, twoFactorSignInHooks } from "./two-factor.js";
 
 // Sizes produced by @serenity-kit/opaque 0.9 (ristretto255, fixed-size
 // outputs), expressed in unpadded base64url characters.
@@ -85,9 +86,13 @@ export const createShared = (options: OpaqueOptions) => {
 
 	const shared = {
 		options,
-		// Both assigned by init, which better-auth runs before serving any request.
+		// All assigned by init, which better-auth runs before serving any request.
 		serverSetup: "",
 		requireVerification: false,
+		signUpDisabled: false,
+		twoFactorUnsupported: false,
+		// The plugin's `hooks.after`: only init knows the other plugins.
+		afterHooks: [] as AfterHook[],
 
 		init: (ctx: AuthContext) => {
 			const configured = options.serverSetup ?? options.OPAQUE_SERVER_KEY;
@@ -114,6 +119,19 @@ export const createShared = (options: OpaqueOptions) => {
 				options.requireEmailVerification ??
 				ctx.options.emailAndPassword?.requireEmailVerification ??
 				false;
+			shared.signUpDisabled =
+				options.disableSignUp ??
+				ctx.options.emailAndPassword?.disableSignUp ??
+				false;
+
+			const twoFactor = twoFactorSignInHooks(ctx);
+			shared.afterHooks.splice(0, shared.afterHooks.length, ...twoFactor.hooks);
+			shared.twoFactorUnsupported = twoFactor.unsupported;
+			if (twoFactor.unsupported) {
+				ctx.logger.warn(
+					"[better-auth-opaque] The twoFactor plugin is installed but its sign-in hook was not found, so OPAQUE sign-in is refused for users with two-factor enabled. Please report this with your better-auth version.",
+				);
+			}
 		},
 
 		/**

@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, test, vi } from "vitest";
 import { opaque } from "../src/server";
 import {
 	createOpaqueTestInstance,
+	errorCode,
 	password,
 	TEST_OPAQUE_PUBLIC_KEY,
 	uniqueEmail,
@@ -103,41 +104,45 @@ describe("opaque: server setup", () => {
 	});
 });
 
-describe("opaque: two-factor and closed sign-up", () => {
-	test("warns that the twoFactor plugin does not guard OPAQUE sign-in", async () => {
-		const withTwoFactor = {
-			logger: { warn: vi.fn() },
-			options: { plugins: [{ id: "two-factor" }] },
-		};
-		await opaque({ serverSetup: TEST_OPAQUE_SERVER_KEY }).init(
-			withTwoFactor as never,
-		);
-		expect(withTwoFactor.logger.warn).toHaveBeenCalledWith(
-			expect.stringContaining("twoFactor"),
-		);
+describe("opaque: disableSignUp", () => {
+	const coreClosed = { emailAndPassword: { enabled: true, disableSignUp: true } };
 
-		const without = initContext();
-		await opaque({ serverSetup: TEST_OPAQUE_SERVER_KEY }).init(without as never);
-		expect(without.logger.warn).not.toHaveBeenCalled();
-	});
-
-	test("disabledPaths closes sign-up, as the reference says", async () => {
-		const t = await createOpaqueTestInstance(
-			{},
-			{
-				disabledPaths: ["/opaque/sign-up/challenge", "/opaque/sign-up/complete"],
-			},
-		);
+	test.each([
+		["the plugin option closes sign-up", { disableSignUp: true }, {}, false],
+		["emailAndPassword.disableSignUp is the default", {}, coreClosed, false],
+		["false keeps OPAQUE open while core is closed", { disableSignUp: false }, coreClosed, true],
+	] as const)("%s", async (_, pluginOptions, authOptions, open) => {
+		const t = await createOpaqueTestInstance(pluginOptions, authOptions);
 		try {
-			const email = uniqueEmail("closed");
+			const email = uniqueEmail("gate");
 			const signUp = await t.client.signUp.opaque({
 				email,
-				name: "Closed",
+				name: "Gate",
 				password,
 			});
-			expect(signUp.error?.status).toBe(404);
 			const { internalAdapter } = await t.auth.$context;
-			expect(await internalAdapter.findUserByEmail(email)).toBeNull();
+			const created = await internalAdapter.findUserByEmail(email);
+			if (open) {
+				expect(signUp.error).toBeNull();
+				expect(created).not.toBeNull();
+				return;
+			}
+			expect(signUp.error).toMatchObject({
+				code: "SIGN_UP_DISABLED",
+				status: 400,
+			});
+			expect(created).toBeNull();
+			// The complete step is closed too, not only the challenge.
+			const complete = await t.client.$fetch("/opaque/sign-up/complete", {
+				method: "POST",
+				body: {
+					email,
+					name: "Gate",
+					registrationRecord: "A".repeat(256),
+					state: "x",
+				},
+			});
+			expect(errorCode(complete)).toBe("SIGN_UP_DISABLED");
 		} finally {
 			await t.server.close();
 		}

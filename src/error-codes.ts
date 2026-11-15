@@ -15,6 +15,9 @@ export const OPAQUE_ERROR_CODES = defineCodes({
 	INVALID_REQUEST: "Invalid OPAQUE request",
 	INVALID_TOKEN: "Invalid or expired token",
 	EMAIL_NOT_VERIFIED: "Email not verified",
+	SIGN_UP_DISABLED: "Sign up is disabled",
+	TWO_FACTOR_UNSUPPORTED:
+		"Two-factor is enabled for this account but could not be applied to this sign-in",
 	EMAIL_MISMATCH: "Email does not match the challenge",
 	USER_MISMATCH: "User does not match the authenticated session",
 	NO_OPAQUE_ACCOUNT: "No OPAQUE password is set for this account",
