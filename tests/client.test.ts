@@ -264,6 +264,77 @@ describe("opaque client: fetch semantics", () => {
 	});
 });
 
+describe("opaque client: minPasswordLength", () => {
+	test("a short new password fails on the client before any request", async () => {
+		await ready;
+		const t = await createOpaqueTestInstance();
+		try {
+			const { requests, customFetchImpl } = recorder();
+			const email = uniqueEmail("short");
+			const signUp = await t.client.signUp.opaque(
+				{ email, name: "Short", password: "1234567" },
+				{ customFetchImpl },
+			);
+			expect(signUp.error).toMatchObject({
+				code: "PASSWORD_TOO_SHORT",
+				status: 400,
+			});
+
+			await t.client.signUp.opaque({ email, name: "Short", password });
+			const device = t.createSessionClient();
+			await device.signIn.opaque({ email, password });
+			const change = await device.opaque.changePassword(
+				{ currentPassword: password, newPassword: "short" },
+				{ customFetchImpl },
+			);
+			expect(change.error?.code).toBe("PASSWORD_TOO_SHORT");
+			const reset = await t.client.opaque.resetPassword(
+				{ token: "any", newPassword: "" },
+				{ customFetchImpl },
+			);
+			expect(reset.error?.code).toBe("PASSWORD_TOO_SHORT");
+			expect(requests).toEqual([]);
+			expect((await t.client.signIn.opaque({ email, password })).error).toBeNull();
+		} finally {
+			await t.server.close();
+		}
+	});
+
+	test("is configurable and never applies to the password being proved", async () => {
+		await ready;
+		const t = await createOpaqueTestInstance({}, {}, { minPasswordLength: 4 });
+		try {
+			const email = uniqueEmail("floor");
+			const tooShort = await t.client.signUp.opaque({
+				email,
+				name: "Floor",
+				password: "abc",
+			});
+			expect(tooShort.error?.code).toBe("PASSWORD_TOO_SHORT");
+			const signUp = await t.client.signUp.opaque({
+				email,
+				name: "Floor",
+				password: "abcd",
+			});
+			expect(signUp.error).toBeNull();
+
+			// A stricter client still signs in, and changes away from, a
+			// password registered under a looser one.
+			const strict = t.createSessionClient({ minPasswordLength: 12 });
+			expect(
+				(await strict.signIn.opaque({ email, password: "abcd" })).error,
+			).toBeNull();
+			const change = await strict.opaque.changePassword({
+				currentPassword: "abcd",
+				newPassword: "twelve-chars-long",
+			});
+			expect(change.error).toBeNull();
+		} finally {
+			await t.server.close();
+		}
+	});
+});
+
 describe("opaque client: bundle boundary", () => {
 	test("client modules never import server code at runtime", () => {
 		const dir = fileURLToPath(new URL("../src", import.meta.url));

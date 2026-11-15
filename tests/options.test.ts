@@ -103,6 +103,47 @@ describe("opaque: server setup", () => {
 	});
 });
 
+describe("opaque: two-factor and closed sign-up", () => {
+	test("warns that the twoFactor plugin does not guard OPAQUE sign-in", async () => {
+		const withTwoFactor = {
+			logger: { warn: vi.fn() },
+			options: { plugins: [{ id: "two-factor" }] },
+		};
+		await opaque({ serverSetup: TEST_OPAQUE_SERVER_KEY }).init(
+			withTwoFactor as never,
+		);
+		expect(withTwoFactor.logger.warn).toHaveBeenCalledWith(
+			expect.stringContaining("twoFactor"),
+		);
+
+		const without = initContext();
+		await opaque({ serverSetup: TEST_OPAQUE_SERVER_KEY }).init(without as never);
+		expect(without.logger.warn).not.toHaveBeenCalled();
+	});
+
+	test("disabledPaths closes sign-up, as the reference says", async () => {
+		const t = await createOpaqueTestInstance(
+			{},
+			{
+				disabledPaths: ["/opaque/sign-up/challenge", "/opaque/sign-up/complete"],
+			},
+		);
+		try {
+			const email = uniqueEmail("closed");
+			const signUp = await t.client.signUp.opaque({
+				email,
+				name: "Closed",
+				password,
+			});
+			expect(signUp.error?.status).toBe(404);
+			const { internalAdapter } = await t.auth.$context;
+			expect(await internalAdapter.findUserByEmail(email)).toBeNull();
+		} finally {
+			await t.server.close();
+		}
+	});
+});
+
 describe("opaque: rate limits", () => {
 	const ruleFor = (plugin: ReturnType<typeof opaque>, path: string) => {
 		const rule = plugin.rateLimit.find((r) => r.pathMatcher(path));

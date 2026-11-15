@@ -9,6 +9,7 @@ const defineCodes = <const T extends Record<string, string>>(codes: T) =>
 export const OPAQUE_ERROR_CODES = defineCodes({
 	INVALID_EMAIL_OR_PASSWORD: "Invalid email or password",
 	INVALID_PASSWORD: "Invalid password",
+	PASSWORD_TOO_SHORT: "Password too short",
 	INVALID_LOGIN_STATE: "Invalid or expired login state",
 	INVALID_REGISTRATION_RECORD: "Invalid registration record",
 	INVALID_REQUEST: "Invalid OPAQUE request",

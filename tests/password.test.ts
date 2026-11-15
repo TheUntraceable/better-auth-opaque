@@ -134,7 +134,7 @@ describe("opaque: authenticated password operations", () => {
 
 		const noAccount = await device.opaque.changePassword({
 			currentPassword: "x",
-			newPassword: "y",
+			newPassword: "new-password-y",
 		});
 		expect(noAccount.error?.code).toBe("NO_OPAQUE_ACCOUNT");
 
@@ -146,7 +146,9 @@ describe("opaque: authenticated password operations", () => {
 		expect(signIn.error).toBeNull();
 		expect(signIn.data?.exportKey).toBe(set.data?.exportKey);
 
-		const again = await device.opaque.setPassword({ password: "another" });
+		const again = await device.opaque.setPassword({
+			password: "another-password",
+		});
 		expect(again.error?.code).toBe("OPAQUE_ACCOUNT_EXISTS");
 	});
 
