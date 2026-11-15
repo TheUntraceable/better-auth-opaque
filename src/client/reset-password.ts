@@ -1,5 +1,5 @@
-import type { Reply, Requester } from "./request";
-import type { OpaqueFetchOptions, OpaqueResult } from "./types";
+import type { Reply, Requester } from "./request.js";
+import type { OpaqueFetchOptions, OpaqueResult } from "./types.js";
 
 type ResetPasswordData = Reply<"/opaque/reset-password/complete"> & {
 	exportKey: string;

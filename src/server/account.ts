@@ -5,7 +5,7 @@ import {
 	type GenericEndpointContext,
 } from "better-auth";
 import { makeSignature } from "better-auth/crypto";
-import { OPAQUE_ERROR_CODES } from "../error-codes";
+import { OPAQUE_ERROR_CODES } from "../error-codes.js";
 
 type OpaqueAccount = Account & {
 	registrationRecord?: string | null;

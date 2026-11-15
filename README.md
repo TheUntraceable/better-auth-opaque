@@ -263,7 +263,7 @@ bun install
 bun run typecheck    # tsc over src/ and tests/ (the type-level tests only bite here)
 bun run build        # tsc -> dist/
 bun run test         # vitest on better-auth's HTTP test instance, run under bun
-bun run check        # all three; run by the release workflow and prepublishOnly
+bun run check        # these + test:dist; run by the release workflow and prepublishOnly
 bun run test:timing  # opt-in statistical timing tests (slow)
 bun run test:server  # manual Express server on :8080
 ```

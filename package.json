@@ -54,9 +54,10 @@
 		"typecheck": "tsc -p tsconfig.test.json",
 		"test": "bunx --bun vitest run",
 		"test:node": "vitest run",
+		"test:dist": "node tests/load-dist.mjs",
 		"test:timing": "cross-env OPAQUE_TIMING_TESTS=1 bunx --bun vitest run tests/timing/ --no-file-parallelism",
 		"test:server": "bun tests/server.ts",
-		"check": "bun run typecheck && bun run build && bun run test",
+		"check": "bun run typecheck && bun run build && bun run test:dist && bun run test",
 		"prepublishOnly": "bun run check"
 	},
 	"devDependencies": {

@@ -446,7 +446,8 @@ describe("opaque: sign-up and sign-in", () => {
 			const [abandoned] = await identifiers();
 			expect(abandoned).toBeDefined();
 			// Date only: faking timers would stall the in-process HTTP server.
-			vi.setSystemTime(Date.now() + 2000);
+			// Two minutes, since newer 1.7 releases purge at most once a minute.
+			vi.setSystemTime(Date.now() + 120_000);
 			await challenge();
 			const remaining = await identifiers();
 			expect(remaining).toHaveLength(1);

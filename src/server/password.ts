@@ -6,14 +6,14 @@ import {
 } from "better-auth/api";
 import { parseUserOutput } from "better-auth/db";
 import * as z from "zod";
-import { OPAQUE_ERROR_CODES } from "../error-codes";
+import { OPAQUE_ERROR_CODES } from "../error-codes.js";
 import {
 	assertValidRegistrationRecord,
 	findOpaqueAccount,
 	loginIdentity,
 	matchesLoginIdentity,
 	upsertOpaqueAccount,
-} from "./account";
+} from "./account.js";
 import {
 	loginRequest,
 	loginResult,
@@ -21,8 +21,8 @@ import {
 	registrationRequest,
 	type Shared,
 	state,
-} from "./shared";
-import { PURPOSE } from "./state";
+} from "./shared.js";
+import { PURPOSE } from "./state.js";
 
 // sensitiveSessionMiddleware re-reads the session from the store but ignores
 // session.freshAge; freshSessionMiddleware then applies core's freshness

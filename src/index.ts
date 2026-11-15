@@ -1,4 +1,4 @@
-export { OpaqueFetchError, opaqueClient, OPAQUE_ERROR_CODES } from "./client";
+export { OpaqueFetchError, opaqueClient, OPAQUE_ERROR_CODES } from "./client.js";
 export type {
 	OpaqueClientError,
 	OpaqueClientOptions,
@@ -7,6 +7,6 @@ export type {
 	OpaqueFetch,
 	OpaqueFetchOptions,
 	OpaqueResult,
-} from "./client";
-export { opaque } from "./server";
-export type { OpaqueOptions } from "./server";
+} from "./client.js";
+export { opaque } from "./server.js";
+export type { OpaqueOptions } from "./server.js";

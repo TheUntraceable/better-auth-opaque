@@ -2,8 +2,8 @@ import { APIError, generateId, type User } from "better-auth";
 import { createAuthEndpoint, sendVerificationEmailFn } from "better-auth/api";
 import { parseUserInput } from "better-auth/db";
 import * as z from "zod";
-import { OPAQUE_ERROR_CODES } from "../error-codes";
-import { assertValidRegistrationRecord } from "./account";
+import { OPAQUE_ERROR_CODES } from "../error-codes.js";
+import { assertValidRegistrationRecord } from "./account.js";
 import {
 	emailAddress,
 	enforceMinimumDuration,
@@ -12,8 +12,8 @@ import {
 	registrationRequest,
 	type Shared,
 	state,
-} from "./shared";
-import { PURPOSE } from "./state";
+} from "./shared.js";
+import { PURPOSE } from "./state.js";
 
 const MAX_NAME_LENGTH = 100;
 

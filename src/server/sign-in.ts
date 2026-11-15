@@ -2,14 +2,14 @@ import { APIError, generateId } from "better-auth";
 import { createAuthEndpoint, sendVerificationEmailFn } from "better-auth/api";
 import { parseUserOutput } from "better-auth/db";
 import * as z from "zod";
-import { OPAQUE_ERROR_CODES } from "../error-codes";
+import { OPAQUE_ERROR_CODES } from "../error-codes.js";
 import {
 	fakeCredentialId,
 	findOpaqueAccount,
 	type LoginIdentity,
 	loginIdentity,
 	matchesLoginIdentity,
-} from "./account";
+} from "./account.js";
 import {
 	emailAddress,
 	enforceMinimumDuration,
@@ -18,8 +18,8 @@ import {
 	normalizeEmail,
 	type Shared,
 	state,
-} from "./shared";
-import { PURPOSE } from "./state";
+} from "./shared.js";
+import { PURPOSE } from "./state.js";
 
 export const signInEndpoints = (shared: Shared) => {
 	const {

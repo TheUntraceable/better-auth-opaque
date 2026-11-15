@@ -1,12 +1,12 @@
 import { APIError, generateId } from "better-auth";
 import { createAuthEndpoint, originCheck } from "better-auth/api";
 import * as z from "zod";
-import { OPAQUE_ERROR_CODES } from "../error-codes";
+import { OPAQUE_ERROR_CODES } from "../error-codes.js";
 import {
 	assertValidRegistrationRecord,
 	findOpaqueAccount,
 	upsertOpaqueAccount,
-} from "./account";
+} from "./account.js";
 import {
 	emailAddress,
 	enforceMinimumDuration,
@@ -15,8 +15,8 @@ import {
 	registrationRequest,
 	type Shared,
 	state,
-} from "./shared";
-import { PURPOSE } from "./state";
+} from "./shared.js";
+import { PURPOSE } from "./state.js";
 
 const DEFAULT_RESET_PASSWORD_TOKEN_EXPIRES_IN = 60 * 60;
 const MAX_RESET_TOKEN_CHARS = 256;

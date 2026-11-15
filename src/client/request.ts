@@ -1,13 +1,13 @@
 import { client, ready } from "@serenity-kit/opaque";
-import { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "../error-codes";
-import type { opaque } from "../server";
+import { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "../error-codes.js";
+import type { opaque } from "../server.js";
 import type {
 	OpaqueClientError,
 	OpaqueClientStore,
 	OpaqueFetch,
 	OpaqueFetchOptions,
 	OpaqueResult,
-} from "./types";
+} from "./types.js";
 
 type Endpoints = ReturnType<typeof opaque>["endpoints"];
 type Path = Endpoints[keyof Endpoints]["path"];

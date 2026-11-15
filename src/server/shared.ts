@@ -10,15 +10,15 @@ import {
 } from "better-auth";
 import { setSessionCookie } from "better-auth/cookies";
 import * as z from "zod";
-import { OPAQUE_ERROR_CODES } from "../error-codes";
-import type { OpaqueOptions } from "./options";
+import { OPAQUE_ERROR_CODES } from "../error-codes.js";
+import type { OpaqueOptions } from "./options.js";
 import {
 	decryptState,
 	encryptState,
 	type Purpose,
 	type StatePayload,
 	stateIdentifier,
-} from "./state";
+} from "./state.js";
 
 // Sizes produced by @serenity-kit/opaque 0.9 (ristretto255, fixed-size
 // outputs), expressed in unpadded base64url characters.
@@ -131,7 +131,8 @@ export const createShared = (options: OpaqueOptions) => {
 			const stateId = generateId();
 			// Core purges expired rows only in findVerificationValue, not in
 			// consumeVerificationValue, and abandoned challenges never reach complete;
-			// looking up the fresh id runs that purge with its hooks and disableCleanup.
+			// looking up the fresh id runs that purge with its hooks and disableCleanup
+			// (newer 1.7 releases run it at most once a minute).
 			await ctx.context.internalAdapter.findVerificationValue(
 				stateIdentifier(stateId),
 			);

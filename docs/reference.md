@@ -20,7 +20,7 @@
 
 ## Endpoints
 
-All endpoints live under `/api/auth/opaque/` and are rate limited per IP and path: the reset-password request to 3 per 60 seconds, each `*/challenge` endpoint to 3 per 10 seconds, everything else to 5 per 10 seconds. Better Auth reads the client IP from `x-forwarded-for` (or `advanced.ipAddress.ipAddressHeaders`); when it finds no usable IP, as with a multi-hop header and no `advanced.ipAddress.trustedProxies`, every client shares one bucket per path, so any three reset requests within 60 seconds block reset requests for everyone until the window ends. The `rateLimit` option replaces all three with one rule; Better Auth's `rateLimit.customRules` override both. Like every Better Auth limit, they apply only while Better Auth's rate limiter is enabled, which by default is in production only. The two-step flows are driven by the client plugin; call them directly only if you are writing your own client.
+All endpoints live under `/api/auth/opaque/` and are rate limited per IP and path: the reset-password request to 3 per 60 seconds, each `*/challenge` endpoint to 3 per 10 seconds, everything else to 5 per 10 seconds. Better Auth reads the client IP from `x-forwarded-for` (or `advanced.ipAddress.ipAddressHeaders`); when it finds no usable IP, as with a multi-hop header and no `advanced.ipAddress.trustedProxies`, every client shares one bucket per path, so any three reset requests within 60 seconds block reset requests for everyone until the window ends. The header is only as trustworthy as whatever sets it: serve the app behind a proxy that overwrites it, or a client can pick a new bucket with every request. The `rateLimit` option replaces all three with one rule; Better Auth's `rateLimit.customRules` override both. Like every Better Auth limit, they apply only while Better Auth's rate limiter is enabled, which by default is in production only. The two-step flows are driven by the client plugin; call them directly only if you are writing your own client.
 
 | Flow | Method | Path | Auth |
 | :-- | :-- | :-- | :-- |
@@ -68,3 +68,11 @@ Every failure from the plugin carries a `code`. The plugin's codes are available
 | `CHALLENGE_FAILED` | | Still defined for compatibility; no longer produced. |
 
 Failures from Better Auth itself carry core's codes, such as `SESSION_NOT_FRESH`. A rate-limited request gets a 429 with a message and no code.
+
+## Security notes
+
+These add to the [Security](../README.md#security) section of the README.
+
+**2.x accounts and enumeration.** The challenge for an account still on a 2.x record depends on the casing of the typed email, while an unknown email and a 3.x account answer the same in any casing. Two challenges with the same login request can therefore tell a 2.x account apart until its password is changed or reset.
+
+**Session revocation.** Change-password and reset-password delete the user's sessions from the store. As with core, a device whose session is held in the cookie (`session.cookieCache`, or an app with no database) stays signed in until that cookie expires.

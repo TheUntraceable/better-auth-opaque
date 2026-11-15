@@ -4,8 +4,8 @@ import {
 	symmetricDecrypt,
 	symmetricEncrypt,
 } from "better-auth/crypto";
-import { OPAQUE_ERROR_CODES } from "../error-codes";
-import type { LoginIdentity } from "./account";
+import { OPAQUE_ERROR_CODES } from "../error-codes.js";
+import type { LoginIdentity } from "./account.js";
 
 export const PURPOSE = {
 	signUp: "sign-up",

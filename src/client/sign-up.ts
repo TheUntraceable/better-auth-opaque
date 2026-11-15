@@ -1,5 +1,5 @@
-import type { Reply, Requester } from "./request";
-import type { OpaqueFetchOptions, OpaqueResult } from "./types";
+import type { Reply, Requester } from "./request.js";
+import type { OpaqueFetchOptions, OpaqueResult } from "./types.js";
 
 type SignUpData = Reply<"/opaque/sign-up/complete"> & {
 	exportKey: string;

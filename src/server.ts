@@ -1,15 +1,15 @@
 import { ready } from "@serenity-kit/opaque";
 import type { BetterAuthPlugin } from "better-auth";
-import { OPAQUE_ERROR_CODES } from "./error-codes";
-import type { OpaqueOptions } from "./server/options";
-import { passwordEndpoints } from "./server/password";
-import { resetPasswordEndpoints } from "./server/reset-password";
-import { createShared } from "./server/shared";
-import { signInEndpoints } from "./server/sign-in";
-import { signUpEndpoints } from "./server/sign-up";
+import { OPAQUE_ERROR_CODES } from "./error-codes.js";
+import type { OpaqueOptions } from "./server/options.js";
+import { passwordEndpoints } from "./server/password.js";
+import { resetPasswordEndpoints } from "./server/reset-password.js";
+import { createShared } from "./server/shared.js";
+import { signInEndpoints } from "./server/sign-in.js";
+import { signUpEndpoints } from "./server/sign-up.js";
 
-export { OPAQUE_ERROR_CODES } from "./error-codes";
-export type { OpaqueOptions } from "./server/options";
+export { OPAQUE_ERROR_CODES } from "./error-codes.js";
+export type { OpaqueOptions } from "./server/options.js";
 
 export const opaque = (options: OpaqueOptions = {}) => {
 	const shared = createShared(options);

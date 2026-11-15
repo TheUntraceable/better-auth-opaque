@@ -1,6 +1,6 @@
 import { client, ready } from "@serenity-kit/opaque";
-import { fail, type Reply, type Requester } from "./request";
-import type { OpaqueFetchOptions, OpaqueResult } from "./types";
+import { fail, type Reply, type Requester } from "./request.js";
+import type { OpaqueFetchOptions, OpaqueResult } from "./types.js";
 
 type SignInData = Reply<"/opaque/sign-in/complete"> & {
 	exportKey: string;

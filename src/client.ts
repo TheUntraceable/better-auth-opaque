@@ -1,18 +1,18 @@
 import type { BetterAuthClientPlugin } from "better-auth/client";
-import { passwordActions } from "./client/password";
-import { type ClientConfig, createRequester } from "./client/request";
-import { resetPasswordActions } from "./client/reset-password";
-import { signInActions } from "./client/sign-in";
-import { signUpActions } from "./client/sign-up";
+import { passwordActions } from "./client/password.js";
+import { type ClientConfig, createRequester } from "./client/request.js";
+import { resetPasswordActions } from "./client/reset-password.js";
+import { signInActions } from "./client/sign-in.js";
+import { signUpActions } from "./client/sign-up.js";
 import type {
 	OpaqueClientOptions,
 	OpaqueClientStore,
 	OpaqueFetch,
-} from "./client/types";
-import { OPAQUE_ERROR_CODES } from "./error-codes";
-import type { opaque } from "./server";
+} from "./client/types.js";
+import { OPAQUE_ERROR_CODES } from "./error-codes.js";
+import type { opaque } from "./server.js";
 
-export { OpaqueFetchError } from "./client/request";
+export { OpaqueFetchError } from "./client/request.js";
 export type {
 	OpaqueClientError,
 	OpaqueClientOptions,
@@ -20,8 +20,8 @@ export type {
 	OpaqueFetch,
 	OpaqueFetchOptions,
 	OpaqueResult,
-} from "./client/types";
-export { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "./error-codes";
+} from "./client/types.js";
+export { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "./error-codes.js";
 
 export const opaqueClient = (options: OpaqueClientOptions = {}) => {
 	return {

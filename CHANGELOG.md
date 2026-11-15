@@ -52,12 +52,13 @@ Changes are relative to 2.1.0, the last published release.
 - A challenge minted before a password change can no longer complete afterwards.
 - Change-password reads the session from the store (`sensitiveSessionMiddleware`) rather than the cookie cache.
 - Debug logs no longer include emails or whether an account exists.
+- The built package loads under Node's native ESM loader. Relative imports were emitted without extensions, so importing any entry point from plain Node failed with `ERR_MODULE_NOT_FOUND`; bundlers and Bun were unaffected.
 - Base64url field lengths are validated exactly against the sizes `@serenity-kit/opaque` produces.
 
 ### Internal
 
 - Test suite runs on `better-auth/test`'s HTTP test instance under vitest (no external server). Statistical timing tests are opt-in via `OPAQUE_TIMING_TESTS=1`.
-- `bun run typecheck` type-checks the tests (vitest alone never did, so the compile-time plugin-typing assertions were not enforced); `bun run check` runs typecheck, build and tests and backs `prepublishOnly`.
+- `bun run typecheck` type-checks the tests (vitest alone never did, so the compile-time plugin-typing assertions were not enforced); `bun run check` runs typecheck, build, a plain-Node load of `dist/` and tests and backs `prepublishOnly`.
 - GitHub Actions: CI on pushes to master and on pull requests; the release workflow publishes to npm with provenance from a GitHub release whose tag matches package.json `version`, behind the `release` environment.
 - npm metadata (description, keywords, repository, license) on the package.
 
