@@ -20,6 +20,7 @@ import {
 	state,
 } from "./shared.js";
 import { PURPOSE } from "./state.js";
+import { SIGN_IN_COMPLETE_PATH } from "./two-factor.js";
 
 export const signInEndpoints = (shared: Shared) => {
 	const {
@@ -91,7 +92,7 @@ export const signInEndpoints = (shared: Shared) => {
 		),
 
 		opaqueSignInComplete: createAuthEndpoint(
-			"/opaque/sign-in/complete",
+			SIGN_IN_COMPLETE_PATH,
 			{
 				method: "POST",
 				body: z.object({
@@ -145,6 +146,19 @@ export const signInEndpoints = (shared: Shared) => {
 					);
 				}
 
+				if (
+					shared.twoFactorUnsupported &&
+					(user as { twoFactorEnabled?: boolean }).twoFactorEnabled
+				) {
+					throw APIError.from(
+						"FORBIDDEN",
+						OPAQUE_ERROR_CODES.TWO_FACTOR_UNSUPPORTED,
+					);
+				}
+
+				// With the twoFactor plugin installed its hook runs after this
+				// handler: for a user who needs the second factor it deletes this
+				// session and answers `{ twoFactorRedirect: true }` instead.
 				const session = await issueSession(
 					ctx,
 					user,

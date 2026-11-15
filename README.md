@@ -33,7 +33,7 @@ bun add better-auth-opaque
 npm install better-auth-opaque
 ```
 
-Peer dependencies: `better-auth` 1.7 or newer and `zod` 4. `@serenity-kit/opaque` (the WebAssembly OPAQUE implementation) is installed automatically. The server plugin needs a global Web Crypto API (`globalThis.crypto`).
+Peer dependencies: `better-auth` 1.7.3 or newer and `zod` 4. `@serenity-kit/opaque` (the WebAssembly OPAQUE implementation) is installed automatically. The server plugin needs a global Web Crypto API (`globalThis.crypto`).
 
 The plugin adds two columns to the `account` table, `registrationRecord` and `credentialId`. Run your Better Auth migration (`npx @better-auth/cli migrate` or `generate`) after installing.
 
@@ -234,7 +234,7 @@ Two rules follow from this:
 
 **Email changes.** Records are bound to a server-generated credential id, not the email, so `changeEmail` and case differences in the typed email do not lock anyone out. Accounts still on a 2.x record are the exception until their password is changed or reset; see [Upgrading](#upgrading-from-2x).
 
-**Two-factor.** The Better Auth `twoFactor` plugin hooks only the core sign-in routes, so an OPAQUE sign-in currently completes without the second factor. If you need both, enforce the second factor in your own `databaseHooks.session.create.before` or in front of the session.
+**Two-factor.** With Better Auth's `twoFactor` plugin installed, an OPAQUE sign-in by a user who has it enabled stops for the second factor as `signIn.email` does: the result has `twoFactorRedirect: true` and the keys, but no session yet. See the [reference](docs/reference.md#security-notes).
 
 **Core password routes.** With `emailAndPassword` enabled, Better Auth's `/reset-password` and `/set-password` create a server-side hashed credential next to the OPAQUE record. The plugin warns about this at startup. Use `opaque.requestPasswordReset` and `opaque.setPassword` instead.
 
@@ -244,7 +244,7 @@ Two rules follow from this:
 
 3.0.0 is a breaking release. Most apps only need to rerun migrations and rename `changePassword`, plus upgrade `better-auth` if they are coming from 2.0.x.
 
-* **`better-auth` 1.7 or newer is required** as a peer dependency, as in 2.1.0 (2.0.x bundled 1.3). The `Types of property 'getActions' are incompatible` / `Property 'opaque' does not exist` errors from 2.0.3 are gone: its published types gave `getActions` a `$fetch` typed as `BetterFetch` from `@better-fetch/fetch`, typed structurally since 2.1.0.
+* **`better-auth` 1.7.3 or newer is required** as a peer dependency, as in 2.1.0 (2.0.x bundled 1.3). The `Types of property 'getActions' are incompatible` / `Property 'opaque' does not exist` errors from 2.0.3 are gone: its published types gave `getActions` a `$fetch` typed as `BetterFetch` from `@better-fetch/fetch`, typed structurally since 2.1.0.
 * **New `account.credentialId` column.** Run your migration. Records written by 2.x keep working through a fallback until the password is changed or reset, which moves the account to a credential id. 2.x bound each record to the email exactly as it was typed at sign-up, so those users must sign in with that same casing; any other casing fails with `INVALID_EMAIL_OR_PASSWORD`. Change-password on a 2.x account uses the stored, lower-cased email, so a 2.x user who registered in mixed case must reset their password rather than change it.
 * **`authClient.changePassword` is now `authClient.opaque.changePassword`.** The old name refers to Better Auth's built-in action.
 * **Change password requires a fresh session** (2.1.0 accepted any session), and by default it now issues this device a new session instead of signing it out with every other one.

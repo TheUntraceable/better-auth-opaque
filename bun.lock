@@ -20,7 +20,7 @@
         "zod": "^4.6.5",
       },
       "peerDependencies": {
-        "better-auth": "^1.7.0",
+        "better-auth": "^1.7.3",
         "zod": "^4",
       },
     },

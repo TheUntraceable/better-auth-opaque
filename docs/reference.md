@@ -14,6 +14,7 @@
 | `challengeExpiresIn` | `120` | Seconds a challenge stays valid between the two steps. Each one can be completed exactly once. |
 | `timingSafeResponseMs` | off | Minimum response time for the three endpoints whose work depends on whether an account exists. See [Security](../README.md#security). |
 | `rateLimit` | see [Endpoints](#endpoints) | `{ window, max }` applied to every `/opaque/*` endpoint in place of the defaults. |
+| `disableSignUp` | `emailAndPassword.disableSignUp` | Refuse OPAQUE sign-up with `SIGN_UP_DISABLED`. Closing core's sign-up closes this one too; pass `false` to keep OPAQUE sign-up open while core's is closed. |
 | `insecureCreateSessionOnRegister` | `false` | Issue a session straight from sign-up. Makes sign-up an account-existence oracle. Ignored while email verification is required, like core's `autoSignIn`. |
 
 `onExistingUserSignUp`, `onSessionKey`, `sendResetPassword` and Better Auth's `sendVerificationEmail` never change the response: an error they throw is logged.
@@ -64,6 +65,8 @@ Every failure from the plugin carries a `code`. The plugin's codes are available
 | `INVALID_REQUEST` | 400 | A registration or login request had the right size but did not decode as an OPAQUE message. Answered the same whether or not the email exists. |
 | `INVALID_TOKEN` | 400 | Reset token unknown, expired, already used, or issued before the password was last changed, set or reset. |
 | `EMAIL_NOT_VERIFIED` | 403 | Sign-in blocked until the email is verified. |
+| `SIGN_UP_DISABLED` | 400 | Sign-up is closed by `disableSignUp`. |
+| `TWO_FACTOR_UNSUPPORTED` | 403 | The user has two-factor enabled but the plugin could not find the `twoFactor` plugin's sign-in hook, so it refused the sign-in instead of skipping the second factor. |
 | `EMAIL_MISMATCH` | 400 | Sign-up complete sent a different email from its challenge. |
 | `USER_MISMATCH` | 401 | Change or set password completed with a challenge issued to another user, or the user no longer exists. |
 | `NO_OPAQUE_ACCOUNT` | 400 | The signed-in user has no OPAQUE password. Use `setPassword`. |
@@ -85,8 +88,12 @@ These add to the [Security](../README.md#security) section of the README.
 
 **Reset links.** The emailed link starts with Better Auth's base URL. Set `baseURL` (or `BETTER_AUTH_URL`): without it Better Auth takes the host from each request, so a request sent with another `Host` header gets the victim a link to that host. Changing, setting or resetting a password ends every reset token issued before it.
 
-**Two-factor.** The `twoFactor` plugin guards only core's sign-in routes, so an OPAQUE sign-in issues a session without the second factor; the plugin warns at startup when both are installed.
+**Two-factor.** With Better Auth's `twoFactor` plugin installed, an OPAQUE sign-in runs that plugin's own sign-in step, so trusted devices and its cookie settings behave as they do for `signIn.email`. For a user who needs the second factor the action resolves with `{ twoFactorRedirect: true, twoFactorMethods }` plus `exportKey`, `sessionKey` and `serverPublicKey`, and no `token`; finish with `authClient.twoFactor.verifyTotp` or `verifyOtp`. Three things to know:
 
-**Closing sign-up.** `emailAndPassword.disableSignUp` does not apply here. To close registration, add `/opaque/sign-up/challenge` and `/opaque/sign-up/complete` to Better Auth's `disabledPaths`.
+* `twoFactorClient`'s `onTwoFactorRedirect` and `twoFactorPage` fire inside the request, before the action returns. If you need the export key, read `twoFactorRedirect` from the result instead of navigating from there.
+* `onSessionKey` runs before the second factor, with the provisional session that step replaces.
+* OPAQUE-only users have no core password, so they can only enable two-factor with `twoFactor({ allowPasswordless: true })`.
+
+If a Better Auth release moves that sign-in step where the plugin cannot find it, the plugin warns at startup and sign-in for two-factor users fails with `TWO_FACTOR_UNSUPPORTED` rather than skipping the second factor.
 
 **Session revocation.** Change-password and reset-password delete the user's sessions from the store. As with core, a device whose session is held in the cookie (`session.cookieCache`, or an app with no database) stays signed in until that cookie expires.

@@ -21,6 +21,7 @@ Changes are relative to 2.1.0, the last published release.
 - `OPAQUE_SERVER_KEY` renamed to `serverSetup`. The old name still works as a deprecated alias, so this is not breaking.
 - Behaviour change: rate limits on every `/opaque/*` endpoint, per IP and path (2.x had none): 3 per 60 s for the reset-password request, 3 per 10 s for each `*/challenge` endpoint, 5 per 10 s for the rest. The new `rateLimit: { window, max }` option replaces them with one rule.
 - Behaviour change: `insecureCreateSessionOnRegister` is ignored while email verification is required, like core's `autoSignIn`, and a failed session insert returns 500 `FAILED_TO_CREATE_SESSION` instead of a session-less success.
+- `better-auth` peer range is `^1.7.3` (was `^1.7.0`). 1.7.0 to 1.7.2 require an `account.issuer` value the plugin never wrote, so sign-up failed there with a 500.
 - `typescript` is no longer a peer dependency.
 
 ### Added
@@ -40,7 +41,8 @@ Changes are relative to 2.1.0, the last published release.
 - Additional user fields and `image` accepted at sign-up.
 - Disallowed, missing or invalid additional fields are rejected before the email lookup, so those rejections do not reveal whether the email is registered.
 - `opaqueClient({ minPasswordLength })`, default 8 like core: a shorter new password fails on the client with `PASSWORD_TOO_SHORT` before any request. 2.x accepted any password, including an empty one, because core's length rule never sees an OPAQUE password.
-- A startup warning when the `twoFactor` plugin is installed, since it does not guard OPAQUE sign-in.
+- Two-factor: with Better Auth's `twoFactor` plugin installed, an OPAQUE sign-in stops for the second factor like `signIn.email` (`twoFactorRedirect: true` and the keys, no session until it is verified). 2.x issued a session from the password alone.
+- `disableSignUp`. Behaviour change: it defaults to `emailAndPassword.disableSignUp`, which 2.x ignored, so closing core's sign-up now closes OPAQUE sign-up too unless you pass `disableSignUp: false`.
 - `timingSafeResponseMs`, an opt-in minimum response time for the sign-in challenge, sign-up completion and reset request.
 - `OPAQUE_ERROR_CODES` with typed error codes on both plugins. `CHALLENGE_FAILED` is exported but not produced.
 - `better-auth-opaque/client` and `better-auth-opaque/server` entry points; `sideEffects: false`. Browser code should use `/client`: the root export also includes the server plugin.
