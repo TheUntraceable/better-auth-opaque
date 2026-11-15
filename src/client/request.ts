@@ -3,6 +3,7 @@ import { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "../error-codes.js";
 import type { opaque } from "../server.js";
 import type {
 	OpaqueClientError,
+	OpaqueClientOptions,
 	OpaqueClientStore,
 	OpaqueFetch,
 	OpaqueFetchOptions,
@@ -84,14 +85,24 @@ const replayFirstRequestHeaders = (
 	};
 };
 
+const DEFAULT_MIN_PASSWORD_LENGTH = 8;
+
 export const createRequester = (
 	$fetch: OpaqueFetch,
 	$store: OpaqueClientStore,
 	config: ClientConfig | undefined,
-	serverPublicKey: string | undefined,
+	{
+		serverPublicKey,
+		minPasswordLength = DEFAULT_MIN_PASSWORD_LENGTH,
+	}: OpaqueClientOptions,
 ) => {
 	const serverKeyMismatch = (serverStaticPublicKey: string) =>
 		serverPublicKey !== undefined && serverPublicKey !== serverStaticPublicKey;
+
+	// Counted like core's minPasswordLength. Only for a password being set:
+	// one already registered must still be able to sign in.
+	const passwordTooShort = (password: string) =>
+		password.length < minPasswordLength;
 
 	/**
 	 * Runs one action's requests as a single call: transport options go on
@@ -197,6 +208,9 @@ export const createRequester = (
 			serverPublicKey: string;
 		}>
 	> => {
+		if (passwordTooShort(password)) {
+			return fail("PASSWORD_TOO_SHORT", 400, "Bad Request");
+		}
 		await ready;
 		const { clientRegistrationState, registrationRequest } =
 			client.startRegistration({ password });
@@ -222,7 +236,7 @@ export const createRequester = (
 		};
 	};
 
-	return { run, register, serverKeyMismatch };
+	return { run, register, serverKeyMismatch, passwordTooShort };
 };
 
 export type Requester = ReturnType<typeof createRequester>;

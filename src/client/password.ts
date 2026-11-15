@@ -17,6 +17,7 @@ export const passwordActions = ({
 	run,
 	register,
 	serverKeyMismatch,
+	passwordTooShort,
 }: Requester) => ({
 	/**
 	 * Change the password of the signed-in user. Proves the current
@@ -45,6 +46,9 @@ export const passwordActions = ({
 		run(
 			{ ...fetchOptions, ...inline },
 			async (post) => {
+				if (passwordTooShort(newPassword)) {
+					return fail("PASSWORD_TOO_SHORT", 400, "Bad Request");
+				}
 				await ready;
 				const { clientLoginState, startLoginRequest } = client.startLogin({
 					password: currentPassword,

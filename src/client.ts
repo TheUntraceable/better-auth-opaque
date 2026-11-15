@@ -37,7 +37,7 @@ export const opaqueClient = (options: OpaqueClientOptions = {}) => {
 				$fetch,
 				$store,
 				clientOptions,
-				options.serverPublicKey,
+				options,
 			);
 			return {
 				signUp: signUpActions(requester),

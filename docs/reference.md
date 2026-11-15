@@ -18,6 +18,13 @@
 
 `onExistingUserSignUp`, `onSessionKey`, `sendResetPassword` and Better Auth's `sendVerificationEmail` never change the response: an error they throw is logged.
 
+The client plugin, `opaqueClient(options)`, takes two:
+
+| Option | Default | Purpose |
+| :-- | :-- | :-- |
+| `serverPublicKey` | none | Pins the server's OPAQUE public key; a handshake with any other key fails with `SERVER_KEY_MISMATCH`. |
+| `minPasswordLength` | `8` | Shortest password accepted when one is set (sign-up, change, set, reset). The server never sees the password, so this is the only length rule there is, and only as strong as the client that runs it. |
+
 ## Endpoints
 
 All endpoints live under `/api/auth/opaque/` and are rate limited per IP and path: the reset-password request to 3 per 60 seconds, each `*/challenge` endpoint to 3 per 10 seconds, everything else to 5 per 10 seconds. Better Auth reads the client IP from `x-forwarded-for` (or `advanced.ipAddress.ipAddressHeaders`); when it finds no usable IP, as with a multi-hop header and no `advanced.ipAddress.trustedProxies`, every client shares one bucket per path, so any three reset requests within 60 seconds block reset requests for everyone until the window ends. The header is only as trustworthy as whatever sets it: serve the app behind a proxy that overwrites it, or a client can pick a new bucket with every request. The `rateLimit` option replaces all three with one rule; Better Auth's `rateLimit.customRules` override both. Like every Better Auth limit, they apply only while Better Auth's rate limiter is enabled, which by default is in production only. The two-step flows are driven by the client plugin; call them directly only if you are writing your own client.
@@ -51,10 +58,11 @@ Every failure from the plugin carries a `code`. The plugin's codes are available
 | :-- | :-- | :-- |
 | `INVALID_EMAIL_OR_PASSWORD` | 401 | Wrong password, or no account with that email. Usually *client*: a wrong password never reaches the server. |
 | `INVALID_PASSWORD` | 401 | Wrong current password during a change. Usually *client*, like the above. |
+| `PASSWORD_TOO_SHORT` | 400 | *Client*: a new password is shorter than `minPasswordLength`. No request is sent. |
 | `INVALID_LOGIN_STATE` | 400 | The challenge expired, was already used, or belongs to another flow. Start over. A change-password challenge also fails this way once the password has changed since it was issued. |
 | `INVALID_REGISTRATION_RECORD` | 400 | The client sent a record the server could not use. |
 | `INVALID_REQUEST` | 400 | A registration or login request had the right size but did not decode as an OPAQUE message. Answered the same whether or not the email exists. |
-| `INVALID_TOKEN` | 400 | Reset token unknown, expired or already used. |
+| `INVALID_TOKEN` | 400 | Reset token unknown, expired, already used, or issued before the password was last changed, set or reset. |
 | `EMAIL_NOT_VERIFIED` | 403 | Sign-in blocked until the email is verified. |
 | `EMAIL_MISMATCH` | 400 | Sign-up complete sent a different email from its challenge. |
 | `USER_MISMATCH` | 401 | Change or set password completed with a challenge issued to another user, or the user no longer exists. |
@@ -74,5 +82,11 @@ Failures from Better Auth itself carry core's codes, such as `SESSION_NOT_FRESH`
 These add to the [Security](../README.md#security) section of the README.
 
 **2.x accounts and enumeration.** The challenge for an account still on a 2.x record depends on the casing of the typed email, while an unknown email and a 3.x account answer the same in any casing. Two challenges with the same login request can therefore tell a 2.x account apart until its password is changed or reset.
+
+**Reset links.** The emailed link starts with Better Auth's base URL. Set `baseURL` (or `BETTER_AUTH_URL`): without it Better Auth takes the host from each request, so a request sent with another `Host` header gets the victim a link to that host. Changing, setting or resetting a password ends every reset token issued before it.
+
+**Two-factor.** The `twoFactor` plugin guards only core's sign-in routes, so an OPAQUE sign-in issues a session without the second factor; the plugin warns at startup when both are installed.
+
+**Closing sign-up.** `emailAndPassword.disableSignUp` does not apply here. To close registration, add `/opaque/sign-up/challenge` and `/opaque/sign-up/complete` to Better Auth's `disabledPaths`.
 
 **Session revocation.** Change-password and reset-password delete the user's sessions from the store. As with core, a device whose session is held in the cookie (`session.cookieCache`, or an app with no database) stays signed in until that cookie expires.

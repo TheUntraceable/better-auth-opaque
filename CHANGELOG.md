@@ -29,7 +29,7 @@ Changes are relative to 2.1.0, the last published release.
 - `sessionKey` returned from sign-in. The server never stores its copy; the new `onSessionKey({ user, session, sessionKey }, ctx)` option receives it after each successful sign-in.
 - `serverPublicKey` returned from every action except `requestPasswordReset`; `opaqueClient({ serverPublicKey })` pins the server key.
 - `opaque.setPassword` for accounts without an OPAQUE password. Requires a fresh session.
-- `opaque.requestPasswordReset` / `opaque.resetPassword` with `sendResetPassword`, `resetPasswordTokenExpiresIn`, and a redirect endpoint. Reset tokens are single-use and consumed atomically.
+- `opaque.requestPasswordReset` / `opaque.resetPassword` with `sendResetPassword`, `resetPasswordTokenExpiresIn`, and a redirect endpoint. Reset tokens are single-use, consumed atomically, and end when the password is changed, set or reset by any other route.
 - `onExistingUserSignUp` hook.
 - Verification emails on sign-up when `emailVerification.sendOnSignUp` is true, or is unset and verification is required, and on a blocked sign-in when `emailVerification.sendOnSignIn` is true. `callbackURL` on sign-up and sign-in only feeds that email's link: sign-in never responds with a redirect, because Better Auth's client would navigate before the app can store the export key.
 - Errors thrown by `onExistingUserSignUp`, `onSessionKey`, `sendResetPassword` and `sendVerificationEmail` (sync or async) are logged and never change the response.
@@ -39,6 +39,8 @@ Changes are relative to 2.1.0, the last published release.
 - Failures decided on the client carry a `code`, `status` and standard `statusText` (`Unauthorized`), like server errors. A server reply without data fails with `REQUEST_FAILED` (500).
 - Additional user fields and `image` accepted at sign-up.
 - Disallowed, missing or invalid additional fields are rejected before the email lookup, so those rejections do not reveal whether the email is registered.
+- `opaqueClient({ minPasswordLength })`, default 8 like core: a shorter new password fails on the client with `PASSWORD_TOO_SHORT` before any request. 2.x accepted any password, including an empty one, because core's length rule never sees an OPAQUE password.
+- A startup warning when the `twoFactor` plugin is installed, since it does not guard OPAQUE sign-in.
 - `timingSafeResponseMs`, an opt-in minimum response time for the sign-in challenge, sign-up completion and reset request.
 - `OPAQUE_ERROR_CODES` with typed error codes on both plugins. `CHALLENGE_FAILED` is exported but not produced.
 - `better-auth-opaque/client` and `better-auth-opaque/server` entry points; `sideEffects: false`. Browser code should use `/client`: the root export also includes the server plugin.

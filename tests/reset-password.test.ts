@@ -77,6 +77,48 @@ describe("opaque: password reset", () => {
 		expect(sent.length).toBe(before);
 	});
 
+	test("a reset or a password change ends every other outstanding token", async () => {
+		const email = uniqueEmail("reset-stale");
+		await t.client.signUp.opaque({ email, name: "Stale", password });
+		const mails = () => sent.filter((m) => m.email === email);
+		await t.client.opaque.requestPasswordReset({ email, redirectTo: "/reset" });
+		await t.client.opaque.requestPasswordReset({ email, redirectTo: "/reset" });
+		const [used, leftover] = mails();
+
+		const reset = await t.client.opaque.resetPassword({
+			token: used!.token,
+			newPassword: "after-reset-password",
+		});
+		expect(reset.error).toBeNull();
+		const stale = await t.client.opaque.resetPassword({
+			token: leftover!.token,
+			newPassword: "someone-elses-password",
+		});
+		expect(stale.error?.code).toBe("INVALID_TOKEN");
+		const link = await fetch(leftover!.url, { redirect: "manual" });
+		expect(link.headers.get("location")).toContain("error=INVALID_TOKEN");
+
+		await t.client.opaque.requestPasswordReset({ email });
+		const beforeChange = mails().at(-1)!;
+		const device = t.createSessionClient();
+		await device.signIn.opaque({ email, password: "after-reset-password" });
+		const change = await device.opaque.changePassword({
+			currentPassword: "after-reset-password",
+			newPassword: "after-change-password",
+		});
+		expect(change.error).toBeNull();
+		const afterChange = await t.client.opaque.resetPassword({
+			token: beforeChange.token,
+			newPassword: "someone-elses-password",
+		});
+		expect(afterChange.error?.code).toBe("INVALID_TOKEN");
+		const signIn = await t.client.signIn.opaque({
+			email,
+			password: "after-change-password",
+		});
+		expect(signIn.error).toBeNull();
+	});
+
 	test("rejects an unknown token", async () => {
 		const result = await t.client.opaque.resetPassword({
 			token: "not-a-real-token",

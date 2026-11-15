@@ -52,4 +52,12 @@ export interface OpaqueClientOptions {
 	 * or an active man-in-the-middle.
 	 */
 	serverPublicKey?: string | undefined;
+
+	/**
+	 * Shortest password the client accepts when one is being set (sign-up,
+	 * change, set, reset). The server never sees the password, so the client
+	 * is the only place a length rule can run. Default: 8, like core's
+	 * `minPasswordLength`.
+	 */
+	minPasswordLength?: number | undefined;
 }

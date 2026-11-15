@@ -1,4 +1,8 @@
-import { APIError, generateId } from "better-auth";
+import {
+	APIError,
+	type GenericEndpointContext,
+	generateId,
+} from "better-auth";
 import { createAuthEndpoint, originCheck } from "better-auth/api";
 import * as z from "zod";
 import { OPAQUE_ERROR_CODES } from "../error-codes.js";
@@ -23,6 +27,33 @@ const MAX_RESET_TOKEN_CHARS = 256;
 
 const resetToken = z.string().min(1).max(MAX_RESET_TOKEN_CHARS);
 const resetIdentifier = (token: string) => `opaque-reset:${token}`;
+
+// A token is bound to the credential it was issued against, so any password
+// write (change, set, another reset) ends every token still outstanding.
+const resetValue = (userId: string, credentialId: string | null | undefined) =>
+	JSON.stringify({ userId, credentialId: credentialId ?? null });
+
+/** The user a reset token still stands for; null once it is spent, expired or outdated. */
+async function resetTokenUserId(
+	ctx: GenericEndpointContext,
+	token: string,
+): Promise<string | null> {
+	const verification = await ctx.context.internalAdapter.findVerificationValue(
+		resetIdentifier(token),
+	);
+	if (!verification || verification.expiresAt < new Date()) return null;
+	let issued: { userId?: unknown; credentialId?: unknown } | null;
+	try {
+		issued = JSON.parse(verification.value);
+	} catch {
+		return null;
+	}
+	if (typeof issued?.userId !== "string") return null;
+	const account = await findOpaqueAccount(ctx, issued.userId);
+	return (account?.credentialId ?? null) === issued.credentialId
+		? issued.userId
+		: null;
+}
 
 export const resetPasswordEndpoints = (shared: Shared) => {
 	const {
@@ -67,6 +98,11 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 					const found = await ctx.context.internalAdapter.findUserByEmail(
 						email,
 					);
+					// A random id on the missing branch keeps the query count the same.
+					const account = await findOpaqueAccount(
+						ctx,
+						found?.user.id ?? generateId(),
+					);
 					if (!found) {
 						// Touch the verification table on this branch too so the
 						// query pattern matches the real one. The real branch's
@@ -82,7 +118,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 						DEFAULT_RESET_PASSWORD_TOKEN_EXPIRES_IN;
 					await ctx.context.internalAdapter.createVerificationValue({
 						identifier: resetIdentifier(token),
-						value: found.user.id,
+						value: resetValue(found.user.id, account?.credentialId),
 						expiresAt: new Date(Date.now() + expiresIn * 1000),
 					});
 					const callbackURL = encodeURIComponent(ctx.body.redirectTo ?? "");
@@ -118,14 +154,10 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 					ctx.query.callbackURL || "/",
 					ctx.context.baseURL,
 				);
-				const verification =
-					await ctx.context.internalAdapter.findVerificationValue(
-						resetIdentifier(token),
-					);
-				if (!verification || verification.expiresAt < new Date()) {
-					target.searchParams.set("error", "INVALID_TOKEN");
-				} else {
+				if (await resetTokenUserId(ctx, token)) {
 					target.searchParams.set("token", token);
+				} else {
+					target.searchParams.set("error", "INVALID_TOKEN");
 				}
 				throw ctx.redirect(target.toString());
 			},
@@ -148,11 +180,8 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				},
 			},
 			async (ctx) => {
-				const verification =
-					await ctx.context.internalAdapter.findVerificationValue(
-						resetIdentifier(ctx.body.token),
-					);
-				if (!verification || verification.expiresAt < new Date()) {
+				const userId = await resetTokenUserId(ctx, ctx.body.token);
+				if (!userId) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
 				const newCredentialId = generateId();
@@ -162,7 +191,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				});
 				const encrypted = await issueState(ctx, {
 					purpose: PURPOSE.resetPassword,
-					userId: verification.value,
+					userId,
 					newCredentialId,
 					token: ctx.body.token,
 				});
@@ -193,20 +222,15 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 					ctx.body.state,
 					PURPOSE.resetPassword,
 				);
-				const identifier = resetIdentifier(ctx.body.token);
-				const verification =
-					await ctx.context.internalAdapter.findVerificationValue(identifier);
+				const userId = await resetTokenUserId(ctx, ctx.body.token);
 				if (
-					!verification ||
-					verification.expiresAt < new Date() ||
+					!userId ||
 					decoded.token !== ctx.body.token ||
-					decoded.userId !== verification.value
+					decoded.userId !== userId
 				) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
-				const user = await ctx.context.internalAdapter.findUserById(
-					verification.value,
-				);
+				const user = await ctx.context.internalAdapter.findUserById(userId);
 				if (!user) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
 				}
@@ -221,7 +245,7 @@ export const resetPasswordEndpoints = (shared: Shared) => {
 				// after it would let two resets racing on one link both write.
 				if (
 					!(await ctx.context.internalAdapter.consumeVerificationValue(
-						identifier,
+						resetIdentifier(ctx.body.token),
 					))
 				) {
 					throw APIError.from("BAD_REQUEST", OPAQUE_ERROR_CODES.INVALID_TOKEN);
