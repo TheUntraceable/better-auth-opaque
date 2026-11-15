@@ -3,16 +3,16 @@ import { toNodeHandler } from "better-auth/node";
 import express from "express";
 import morgan from "morgan";
 import { opaque } from "../src/server";
+import { TEST_OPAQUE_SERVER_KEY } from "./test-key";
 
-
+// The fallback key is the suite's throwaway test key; never reuse it.
 const auth = betterAuth({
 	emailAndPassword: {
 		enabled: true,
 	},
 	plugins: [
 		opaque({
-			OPAQUE_SERVER_KEY:
-				"bgTA0wwx_5WvwoyDHURXOsnN3u1y2uJLr1vXYGc1_F5yNgubuj6Pf4JVIM83aIWHHJ7GIPUxDW74-j8CEuv0Os4rE4lQ7GnBQk3nVLDl5s1J4BsNrPXqx_i-T44FaZYLQPDzr2huMv49zUIRxA15XVU9dFuzZZgf-XiaaNDnIA0",
+			serverSetup: process.env.OPAQUE_SERVER_KEY ?? TEST_OPAQUE_SERVER_KEY,
 		}),
 	],
 });

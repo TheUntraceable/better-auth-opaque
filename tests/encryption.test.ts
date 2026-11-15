@@ -1,35 +1,94 @@
-import { describe, expect, test } from "bun:test";
-import { encryptServerLoginState } from "../src/utils";
+import { describe, expect, test } from "vitest";
+import { decryptState, encryptState } from "../src/server/state";
 
-describe("ensure encrypted payload sent to client is safe", () => {
-	test("encrypted payload is always the same length", async () => {
-		const secret = "supersecretkey";
+const secret = "supersecretkey";
 
-		const user1 = {
-			id: "user1",
-			email: "user1@example.com",
-			name: "User One",
-		};
-
-		const user2 = {
-			id: "user2",
-			email: "user2@example.com",
-			name: "User Two",
-			extraField: "This is an extra field to change the size",
-		};
-		const serverLoginState = "someServerLoginStateData";
-
-		const encrypted1 = await encryptServerLoginState(
-			serverLoginState,
+describe("encrypted handshake state", () => {
+	test("has the same length whatever it carries", async () => {
+		const small = await encryptState(
+			{
+				purpose: "set-password",
+				stateId: "a",
+				issuedAt: Date.now(),
+				userId: "u",
+				newCredentialId: "n",
+			},
 			secret,
-			user1,
 		);
-		const encrypted2 = await encryptServerLoginState(
-			serverLoginState,
+		const large = await encryptState(
+			{
+				purpose: "change-password",
+				stateId: "b".repeat(32),
+				issuedAt: Date.now(),
+				userId: "u".repeat(36),
+				credentialId: "c".repeat(43),
+				newCredentialId: "n".repeat(43),
+				serverLoginState: "s".repeat(256),
+			},
 			secret,
-			user2,
 		);
+		expect(small).toHaveLength(large.length);
+	});
 
-		expect(encrypted1.length).toBe(encrypted2.length);
+	test("round-trips and strips padding", async () => {
+		const state = {
+			purpose: "sign-in",
+			stateId: "x",
+			issuedAt: 1,
+			userId: "u1",
+			credentialId: "c1",
+			serverLoginState: "s1",
+		} as const;
+		const encrypted = await encryptState(state, secret);
+		const decoded = await decryptState(encrypted, secret, "sign-in", Infinity);
+		expect(decoded).toEqual(state);
+	});
+
+	test("a state issued before a secret rotation still decrypts after it", async () => {
+		const state = {
+			purpose: "set-password",
+			stateId: "x",
+			issuedAt: Date.now(),
+			userId: "u",
+			newCredentialId: "n",
+		} as const;
+		const before = { keys: new Map([[1, "old-secret"]]), currentVersion: 1 };
+		const after = {
+			keys: new Map([
+				[2, "new-secret"],
+				[1, "old-secret"],
+			]),
+			currentVersion: 2,
+		};
+		const encrypted = await encryptState(state, before);
+		await expect(
+			decryptState(encrypted, after, "set-password", Infinity),
+		).resolves.toEqual(state);
+	});
+
+	test("rejects the wrong purpose, an expired state, and tampering", async () => {
+		const encrypted = await encryptState(
+			{
+				purpose: "sign-in",
+				stateId: "x",
+				issuedAt: Date.now() - 10_000,
+				userId: null,
+				credentialId: "c",
+				serverLoginState: "s",
+			},
+			secret,
+		);
+		await expect(
+			decryptState(encrypted, secret, "change-password", Infinity),
+		).rejects.toMatchObject({ body: { code: "INVALID_LOGIN_STATE" } });
+		await expect(
+			decryptState(encrypted, secret, "sign-in", 5_000),
+		).rejects.toMatchObject({ body: { code: "INVALID_LOGIN_STATE" } });
+		await expect(
+			decryptState(`${encrypted.slice(0, -2)}zz`, secret, "sign-in", Infinity),
+		).rejects.toMatchObject({ body: { code: "INVALID_LOGIN_STATE" } });
+		await expect(
+			decryptState(encrypted, "other-secret", "sign-in", Infinity),
+		).rejects.toMatchObject({ body: { code: "INVALID_LOGIN_STATE" } });
 	});
 });

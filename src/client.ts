@@ -1,195 +1,52 @@
 import type { BetterAuthClientPlugin } from "better-auth/client";
-import { client, ready } from "@serenity-kit/opaque";
-import type { opaque } from "./server";
+import { passwordActions } from "./client/password.js";
+import { type ClientConfig, createRequester } from "./client/request.js";
+import { resetPasswordActions } from "./client/reset-password.js";
+import { signInActions } from "./client/sign-in.js";
+import { signUpActions } from "./client/sign-up.js";
+import type {
+	OpaqueClientOptions,
+	OpaqueClientStore,
+	OpaqueFetch,
+} from "./client/types.js";
+import { OPAQUE_ERROR_CODES } from "./error-codes.js";
+import type { opaque } from "./server.js";
 
-type RegisterChallengeResponse = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["getRegisterChallenge"]>>
-type LoginChallengeResponse = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["getLoginChallenge"]>>
-type RegisterComplete = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["completeRegistration"]>>
-type LoginComplete = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["completeLogin"]>>
-type ChangePasswordChallengeResponse = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["getChangePasswordChallenge"]>>
-type ChangePasswordComplete = Awaited<ReturnType<ReturnType<typeof opaque>["endpoints"]["completeChangePassword"]>>
+export { OpaqueFetchError } from "./client/request.js";
+export type {
+	OpaqueClientError,
+	OpaqueClientOptions,
+	OpaqueClientStore,
+	OpaqueFetch,
+	OpaqueFetchOptions,
+	OpaqueResult,
+} from "./client/types.js";
+export { OPAQUE_ERROR_CODES, type OpaqueErrorCode } from "./error-codes.js";
 
-/**
- * Minimal structural view of better-auth's `$fetch`.
- *
- * Deliberately self-contained: letting `$fetch` be inferred emits a
- * reference to `BetterFetch` from `@better-fetch/fetch` in the `.d.ts`, and
- * consumers' TypeScript then fails to match it against the `$fetch` type
- * better-auth declares, even when both resolve the same copy of that
- * package, with "Types of property 'getActions' are incompatible" and the
- * loss of all `authClient.*.opaque` inference.
- * `tests/client-plugin-types.ts` asserts `BetterFetch` stays assignable to
- * this.
- */
-export type OpaqueFetch = <T = unknown>(
-	url: string,
-	options?: {
-		method?: string;
-		body?: unknown;
-		[key: string]: unknown;
-	},
-) => Promise<{
-	data: T | null;
-	error: {
-		code?: string | undefined;
-		message?: string | undefined;
-		status: number;
-		statusText: string;
-	} | null;
-}>;
-
-export const opaqueClient = () => {
+export const opaqueClient = (options: OpaqueClientOptions = {}) => {
 	return {
 		id: "opaque",
-		getActions($fetch: OpaqueFetch) {
+		$InferServerPlugin: {} as ReturnType<typeof opaque>,
+		$ERROR_CODES: OPAQUE_ERROR_CODES,
+		getActions(
+			$fetch: OpaqueFetch,
+			$store: OpaqueClientStore,
+			clientOptions: ClientConfig | undefined,
+		) {
+			const requester = createRequester(
+				$fetch,
+				$store,
+				clientOptions,
+				options.serverPublicKey,
+			);
 			return {
-				signUp: {
-					opaque: async ({ email, name, password }: {
-						email: string;
-						name: string;
-						password: string;
-					}) => {
-						await ready;
-						const { clientRegistrationState, registrationRequest } = client.startRegistration({
-							password
-						})
-						const challengeResponse = await $fetch<RegisterChallengeResponse>("/sign-up/opaque/challenge", {
-							method: "POST",
-							body: {
-								email,
-								registrationRequest
-							},
-						});
-						if (challengeResponse.error || !challengeResponse.data || !challengeResponse.data.challenge) {
-							return {
-								error: challengeResponse.error || {
-									message: "Failed to get registration challenge"
-								}
-							}
-						}
-						const { challenge: registrationResponse } = challengeResponse.data;
-						const { registrationRecord } = client.finishRegistration({
-							clientRegistrationState,
-							password,
-							registrationResponse,
-						})
-						return await $fetch<RegisterComplete>("/sign-up/opaque/complete", {
-							method: "POST",
-							body: {
-								email,
-								name,
-								registrationRecord,
-							},
-						});
-					}
+				signUp: signUpActions(requester),
+				signIn: signInActions(requester),
+				opaque: {
+					...passwordActions(requester),
+					...resetPasswordActions(requester),
 				},
-				signIn: {
-					opaque: async ({ email, password }: {
-						email: string;
-						password: string;
-					}) => {
-						await ready;
-						const { clientLoginState, startLoginRequest } = client.startLogin({
-							password,
-						})
-						const challengeResponse = await $fetch<LoginChallengeResponse>("/sign-in/opaque/challenge", {
-							method: "POST",
-							body: {
-								email,
-								loginRequest: startLoginRequest,
-							},
-						});
-
-						if (!challengeResponse.data || !challengeResponse.data.challenge) {
-							return { data: null, error: { message: "Failed to get registration challenge" } };
-						}
-
-						const { challenge: loginResponse, state: encryptedServerState } = challengeResponse.data;
-
-						const loginAttempt = client.finishLogin({
-							password,
-							clientLoginState,
-							loginResponse,
-						})
-						if (!loginAttempt) {
-							return { data: null, error: { message: "Login failed" } };
-						}
-
-						const { finishLoginRequest: loginResult } = loginAttempt;
-
-						return await $fetch<LoginComplete>("/sign-in/opaque/complete", {
-							method: "POST",
-							body: {
-								email,
-								loginResult,
-								encryptedServerState
-							},
-						});
-					}
-				},
-				changePassword: async ({ currentPassword, newPassword }: {
-					currentPassword: string;
-					newPassword: string;
-				}) => {
-					await ready;
-
-					// Start login flow with current password
-					const { clientLoginState, startLoginRequest } = client.startLogin({
-						password: currentPassword,
-					});
-
-					// Start registration flow with new password
-					const { clientRegistrationState, registrationRequest } = client.startRegistration({
-						password: newPassword,
-					});
-
-					// Get challenges for both operations
-					const challengeResponse = await $fetch<ChangePasswordChallengeResponse>("/opaque/changePassword/challenge", {
-						method: "POST",
-						body: {
-							loginRequest: startLoginRequest,
-							registrationRequest,
-						},
-					});
-
-					if (!challengeResponse.data || !challengeResponse.data.loginChallenge || !challengeResponse.data.registrationChallenge) {
-						return { data: null, error: { message: "Failed to get change password challenge" } };
-					}
-
-					const { loginChallenge, registrationChallenge, state: encryptedServerState } = challengeResponse.data;
-
-					// Finish login with current password
-					const loginAttempt = client.finishLogin({
-						password: currentPassword,
-						clientLoginState,
-						loginResponse: loginChallenge,
-					});
-
-					if (!loginAttempt) {
-						return { data: null, error: { message: "Current password is incorrect" } };
-					}
-
-					const { finishLoginRequest: loginResult } = loginAttempt;
-
-					// Finish registration with new password
-					const { registrationRecord } = client.finishRegistration({
-						clientRegistrationState,
-						password: newPassword,
-						registrationResponse: registrationChallenge,
-					});
-
-					// Complete the change password operation
-					return await $fetch<ChangePasswordComplete>("/opaque/changePassword/complete", {
-						method: "POST",
-						body: {
-							loginResult,
-							registrationRecord,
-							encryptedServerState,
-						},
-					});
-				}
-			}
+			};
 		},
-		// $InferServerPlugin: {} as ReturnType<typeof opaque>,
 	} satisfies BetterAuthClientPlugin;
 };

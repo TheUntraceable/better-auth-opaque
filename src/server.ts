@@ -1,43 +1,44 @@
-import { ready, server } from "@serenity-kit/opaque";
-import { APIError, type BetterAuthPlugin, type User } from "better-auth";
-import { createAuthEndpoint, sessionMiddleware } from "better-auth/api";
-import { setSessionCookie } from "better-auth/cookies";
-import { generateRandomString } from "better-auth/crypto";
-import * as z from "zod";
-import {
-	createDummyRegistrationRecord,
-	decryptServerLoginState,
-	encryptServerLoginState,
-	findOpaqueAccount,
-	LOGIN_REQUEST_LENGTH,
-	type OpaqueOptions,
-	REGISTRATION_RECORD_MAX_LENGTH,
-	REGISTRATION_RECORD_MIN_LENGTH,
-	REGISTRATION_REQUEST_LENGTH,
-	validateBase64Length,
-	validateBase64LengthRange,
-} from "./utils";
+import { ready } from "@serenity-kit/opaque";
+import type { BetterAuthPlugin } from "better-auth";
+import { OPAQUE_ERROR_CODES } from "./error-codes.js";
+import type { OpaqueOptions } from "./server/options.js";
+import { passwordEndpoints } from "./server/password.js";
+import { resetPasswordEndpoints } from "./server/reset-password.js";
+import { createShared } from "./server/shared.js";
+import { signInEndpoints } from "./server/sign-in.js";
+import { signUpEndpoints } from "./server/sign-up.js";
 
-export const opaque = (options?: OpaqueOptions) => {
-	let OPAQUE_SERVER_KEY: string;
+export { OPAQUE_ERROR_CODES } from "./error-codes.js";
+export type { OpaqueOptions } from "./server/options.js";
 
-	if (options?.OPAQUE_SERVER_KEY) {
-		OPAQUE_SERVER_KEY = options.OPAQUE_SERVER_KEY;
-	} else {
-		ready.then(() => {
-			OPAQUE_SERVER_KEY = server.createSetup();
-			console.log(
-				`OPAQUE_SERVER_KEY not provided. Generated a new one for development purposes: ${OPAQUE_SERVER_KEY}`,
-			);
-		});
-	}
-	if (options?.insecureCreateSessionOnRegister) {
-		console.log(`⚠️ WARNING: insecureCreateSessionOnRegister is enabled. This will automatically create a session upon registration, which could lead to user enumeration. Use with caution in production environments.`);
-	}
+export const opaque = (options: OpaqueOptions = {}) => {
+	const shared = createShared(options);
+	// The first matching rule wins, so the catch-all comes last.
+	const rule = (
+		pathMatcher: (path: string) => boolean,
+		window: number,
+		max: number,
+	) => ({
+		pathMatcher,
+		window: options.rateLimit?.window ?? window,
+		max: options.rateLimit?.max ?? max,
+	});
+
 	return {
 		id: "opaque",
-		init: async () => {
+		init: async (ctx) => {
 			await ready;
+			shared.init(ctx);
+			if (options.insecureCreateSessionOnRegister) {
+				ctx.logger.warn(
+					"[better-auth-opaque] insecureCreateSessionOnRegister is enabled: the sign-up endpoint can now reveal whether an email is registered.",
+				);
+			}
+			if (ctx.options.emailAndPassword?.enabled) {
+				ctx.logger.warn(
+					"[better-auth-opaque] emailAndPassword is enabled alongside OPAQUE. Core /reset-password and /set-password create a server-side password hash next to the OPAQUE record. Use opaque.requestPasswordReset / opaque.setPassword instead, or disable emailAndPassword.",
+				);
+			}
 		},
 		schema: {
 			account: {
@@ -45,438 +46,33 @@ export const opaque = (options?: OpaqueOptions) => {
 					registrationRecord: {
 						type: "string",
 						required: false,
-						unique: true,
-						validator: { input: z.string().base64url() },
+						returned: false,
+						input: false,
+					},
+					credentialId: {
+						type: "string",
+						required: false,
+						returned: false,
+						input: false,
 					},
 				},
 			},
 		},
+		rateLimit: [
+			rule((path) => path === "/opaque/reset-password/request", 60, 3),
+			rule(
+				(path) => path.startsWith("/opaque/") && path.endsWith("/challenge"),
+				10,
+				3,
+			),
+			rule((path) => path.startsWith("/opaque/"), 10, 5),
+		],
 		endpoints: {
-			getRegisterChallenge: createAuthEndpoint(
-				"/sign-up/opaque/challenge",
-				{
-					method: "POST",
-					body: z.object({
-						email: z.string().email(),
-						registrationRequest: z.string().base64url(),
-					}),
-				},
-				async (ctx) => {
-					const { email, registrationRequest } = ctx.body;
-
-					validateBase64Length(
-						registrationRequest,
-						REGISTRATION_REQUEST_LENGTH,
-						"registration request",
-					);
-
-					const startTime = performance.now();
-
-					// CRITICAL: Check if user exists to ensure timing consistency
-					// Even though we don't use this information here, checking ensures
-					// both new and existing user registrations hit the database similarly
-					const existingUser =
-						await ctx.context.internalAdapter.findUserByEmail(email);
-
-					ctx.context.logger.debug(
-						`[CHALLENGE] ${email.substring(0, 20)}... - User exists: ${!!existingUser} - DB lookup: ${(performance.now() - startTime).toFixed(2)}ms`,
-					);
-
-					const { registrationResponse } = server.createRegistrationResponse({
-						userIdentifier: email,
-						registrationRequest,
-						serverSetup: OPAQUE_SERVER_KEY,
-					});
-
-					ctx.context.logger.debug(
-						`[CHALLENGE] Total time: ${(performance.now() - startTime).toFixed(2)}ms`,
-					);
-					return { challenge: registrationResponse };
-				},
-			),
-			completeRegistration: createAuthEndpoint(
-				"/sign-up/opaque/complete",
-				{
-					method: "POST",
-					body: z.object({
-						email: z.string().email(),
-						name: z.string().min(1).max(100),
-						registrationRecord: z.string().base64url(),
-					}),
-				},
-				async (ctx) => {
-					const { email, name, registrationRecord } = ctx.body;
-
-					validateBase64LengthRange(
-						registrationRecord,
-						REGISTRATION_RECORD_MIN_LENGTH,
-						REGISTRATION_RECORD_MAX_LENGTH,
-						"registration record",
-					);
-
-					const startTime = performance.now();
-					const now = new Date();
-
-					const existingUser =
-						await ctx.context.internalAdapter.findUserByEmail(email);
-
-					ctx.context.logger.debug(
-						`[COMPLETE] ${email.substring(0, 20)}... - User exists: ${!!existingUser} - DB lookup: ${(performance.now() - startTime).toFixed(2)}ms`,
-					);
-
-					if (!existingUser) {
-						// User doesn't exist - proceed with actual creation
-						const userId = ctx.context.generateId({ model: "user" });
-						const accountId = ctx.context.generateId({ model: "account" });
-
-						if (!userId || !accountId) {
-							throw new Error("Failed to generate user or account ID");
-						}
-
-						const user = await ctx.context.internalAdapter.createUser({
-							email,
-							name,
-							createdAt: now,
-							updatedAt: now,
-						}, { method: "email-password" });
-
-						await ctx.context.internalAdapter.createAccount({
-							accountId,
-							providerId: "opaque",
-							userId: user.id,
-							registrationRecord,
-							createdAt: now,
-							updatedAt: now,
-						});
-
-						if (options?.insecureCreateSessionOnRegister) {
-							const session = await ctx.context.internalAdapter.createSession(
-								user.id,
-								false,
-							);
-							if (session) {
-								await setSessionCookie(ctx, { session, user });
-							}
-						}
-
-						ctx.context.logger.debug(
-							`[COMPLETE] User created - Total time: ${(performance.now() - startTime).toFixed(2)}ms`,
-						);
-					} else {
-						ctx.context.logger.debug(
-							`[COMPLETE] User exists - Total time: ${(performance.now() - startTime).toFixed(2)}ms`,
-						);
-					}
-
-					// Always return success (whether user was created or already existed)
-					// This prevents user enumeration through registration attempts
-					return ctx.json(
-						{
-							success: true,
-							message: "User registered successfully",
-						},
-						{
-							status: 201,
-						},
-					);
-				},
-			),
-
-			getLoginChallenge: createAuthEndpoint(
-				"/sign-in/opaque/challenge",
-				{
-					method: "POST",
-					body: z.object({
-						email: z.string().email(),
-						loginRequest: z.string().base64url(),
-					}),
-				},
-				async (ctx) => {
-					const { email, loginRequest } = ctx.body;
-
-					validateBase64Length(
-						loginRequest,
-						LOGIN_REQUEST_LENGTH,
-						"login request",
-					);
-
-					// CRITICAL: Always generate a dummy record for timing attack resistance
-					// Both code paths (user exists/doesn't exist) must perform the same expensive operations
-					const [dummyRecord, user] = await Promise.all([
-						createDummyRegistrationRecord(),
-						ctx.context.internalAdapter.findUserByEmail(email),
-					]);
-
-					let registrationRecord: string;
-					let userToEncrypt: {
-						id: string;
-						email: string;
-						name: string;
-						[key: string]: unknown;
-					} | null = null;
-
-					if (!user) {
-						// User doesn't exist - use the dummy record
-						registrationRecord = dummyRecord;
-						userToEncrypt = {
-							id: generateRandomString(12),
-							email,
-							name: generateRandomString(24),
-						};
-					} else {
-						// User exists - get their real record but discard the dummy we generated
-						userToEncrypt = user.user;
-						const opaqueAccount = await findOpaqueAccount(ctx, user.user.id);
-						registrationRecord =
-							opaqueAccount?.registrationRecord || dummyRecord;
-					}
-
-					const { loginResponse, serverLoginState } = server.startLogin({
-						userIdentifier: email,
-						startLoginRequest: loginRequest,
-						serverSetup: OPAQUE_SERVER_KEY,
-						registrationRecord,
-					});
-
-					const encryptedServerState = await encryptServerLoginState(
-						serverLoginState,
-						ctx.context.secret,
-						userToEncrypt,
-					);
-
-					return { challenge: loginResponse, state: encryptedServerState };
-				},
-			),
-
-			completeLogin: createAuthEndpoint(
-				"/sign-in/opaque/complete",
-				{
-					method: "POST",
-					body: z.object({
-						email: z.string().email(),
-						loginResult: z.string().base64url(),
-						encryptedServerState: z.string(),
-						dontRememberMe: z.boolean().optional(),
-					}),
-				},
-				async (ctx) => {
-					const { loginResult, encryptedServerState, dontRememberMe } =
-						ctx.body;
-					let serverLoginState: string;
-					let user: User | null;
-
-					try {
-						({ serverLoginState, user } = await decryptServerLoginState(
-							encryptedServerState,
-							ctx.context.secret,
-						));
-					} catch {
-						throw new APIError("BAD_REQUEST", {
-							message: "Invalid login state",
-						});
-					}
-
-					const { sessionKey } = server.finishLogin({
-						finishLoginRequest: loginResult,
-						serverLoginState: serverLoginState,
-					});
-
-					if (!sessionKey) {
-						throw new APIError("UNAUTHORIZED", {
-							message: "Login failed",
-						});
-					}
-
-					// If user is null, it means the user didn't exist during challenge phase
-					// This shouldn't happen with valid OPAQUE flow, but we check for safety
-					if (!user) {
-						throw new APIError("UNAUTHORIZED", {
-							message: "Login failed",
-						});
-					}
-
-					const session = await ctx.context.internalAdapter.createSession(
-						user.id,
-						dontRememberMe || false,
-					);
-					if (!session) {
-						throw new APIError("INTERNAL_SERVER_ERROR", {
-							message: "Failed to create session",
-						});
-					}
-
-					await setSessionCookie(ctx, { session, user: user as User });
-
-					return ctx.json({
-						token: session.token,
-						success: true,
-						user: {
-							id: user.id,
-						},
-					});
-				},
-			),
-
-			getChangePasswordChallenge: createAuthEndpoint(
-				"/opaque/changePassword/challenge",
-				{
-					method: "POST",
-					requireHeaders: true,
-					body: z.object({
-						loginRequest: z.string().base64url(),
-						registrationRequest: z.string().base64url(),
-					}),
-					use: [sessionMiddleware]
-				},
-				async (ctx) => {
-					const { loginRequest, registrationRequest } = ctx.body;
-					const email = ctx.context.session.user.email;
-					validateBase64Length(
-						loginRequest,
-						LOGIN_REQUEST_LENGTH,
-						"login request",
-					);
-					validateBase64Length(
-						registrationRequest,
-						REGISTRATION_REQUEST_LENGTH,
-						"registration request",
-					);
-
-					const startTime = performance.now();
-
-					// Always perform OPAQUE operations to mitigate timing attacks
-					const opaqueAccount = await findOpaqueAccount(ctx, ctx.context.session.user.id);
-					let registrationRecord: string;
-					if (!opaqueAccount?.registrationRecord) {
-						// Use dummy record if no OPAQUE account exists
-						registrationRecord = await createDummyRegistrationRecord();
-					} else {
-						registrationRecord = opaqueAccount.registrationRecord;
-					}
-
-					// Step 1: Verify old password with login challenge (real or dummy)
-					const { loginResponse, serverLoginState } = server.startLogin({
-						userIdentifier: email,
-						startLoginRequest: loginRequest,
-						serverSetup: OPAQUE_SERVER_KEY,
-						registrationRecord,
-					});
-
-					// Step 2: Generate new password challenge
-					const { registrationResponse } = server.createRegistrationResponse({
-						userIdentifier: email,
-						registrationRequest,
-						serverSetup: OPAQUE_SERVER_KEY,
-					});
-
-					// Encrypt the server login state for verification in complete step
-					const encryptedServerState = await encryptServerLoginState(
-						serverLoginState,
-						ctx.context.secret,
-						ctx.context.session.user,
-					);
-
-					ctx.context.logger.debug(
-						`[CHANGE_PASSWORD] Total time: ${(performance.now() - startTime).toFixed(2)}ms`,
-					);
-
-					return {
-						loginChallenge: loginResponse,
-						registrationChallenge: registrationResponse,
-						state: encryptedServerState,
-					};
-				},
-			),
-
-			completeChangePassword: createAuthEndpoint(
-				"/opaque/changePassword/complete",
-				{
-					method: "POST",
-					requireHeaders: true,
-					body: z.object({
-						loginResult: z.string().base64url(),
-						registrationRecord: z.string().base64url(),
-						encryptedServerState: z.string(),
-					}),
-					use: [sessionMiddleware]
-				},
-				async (ctx) => {
-					const { loginResult, registrationRecord, encryptedServerState } =
-						ctx.body;
-
-					validateBase64LengthRange(
-						registrationRecord,
-						REGISTRATION_RECORD_MIN_LENGTH,
-						REGISTRATION_RECORD_MAX_LENGTH,
-						"registration record",
-					);
-					validateBase64LengthRange(
-						registrationRecord,
-						REGISTRATION_RECORD_MIN_LENGTH,
-						REGISTRATION_RECORD_MAX_LENGTH,
-						"registration record",
-					)
-					let serverLoginState: string;
-					let user: User | null;
-
-					try {
-						({ serverLoginState, user } = await decryptServerLoginState(
-							encryptedServerState,
-							ctx.context.secret,
-						));
-					} catch {
-						throw new APIError("BAD_REQUEST", {
-							message: "Invalid login state",
-						});
-					}
-
-					// CRITICAL: Verify decrypted user matches the authenticated session user
-					// An attacker could steal this from any other request if we didn't verify
-					if (!user || user.id !== ctx.context.session.user.id) {
-						throw new APIError("UNAUTHORIZED", {
-							message: "User mismatch",
-						});
-					}
-					const opaqueAccount = await findOpaqueAccount(ctx, ctx.context.session.user.id);
-					if (!opaqueAccount) {
-						throw new APIError("BAD_REQUEST", {
-							message: "No OPAQUE account found",
-						});
-					}
-					// Verify the old password
-					const { sessionKey } = server.finishLogin({
-						finishLoginRequest: loginResult,
-						serverLoginState: serverLoginState,
-					});
-
-					if (!sessionKey) {
-						throw new APIError("UNAUTHORIZED", {
-							message: "Invalid current password",
-						});
-					}
-
-					// Old password verified, now update to new password
-
-					await ctx.context.internalAdapter.updateAccount(
-						opaqueAccount.id,
-						{
-							registrationRecord,
-							updatedAt: new Date(),
-						} as Partial<typeof opaqueAccount>,
-					);
-					// Invalidate all sessions
-					await ctx.context.internalAdapter.deleteUserSessions(user.id)
-
-					ctx.context.logger.debug(
-						`[CHANGE_PASSWORD] Password changed successfully for ${ctx.context.session.user.email.substring(0, 20)}...`,
-					);
-
-					return ctx.json({
-						success: true,
-						message: "Password changed successfully",
-					});
-				},
-			),
+			...signUpEndpoints(shared),
+			...signInEndpoints(shared),
+			...passwordEndpoints(shared),
+			...resetPasswordEndpoints(shared),
 		},
+		$ERROR_CODES: OPAQUE_ERROR_CODES,
 	} satisfies BetterAuthPlugin;
 };
